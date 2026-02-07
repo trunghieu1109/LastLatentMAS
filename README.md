@@ -78,6 +78,12 @@ Explore community-driven extensions that expand LatentMAS into new domains, arch
 **What it adds:** Supports heterogeneous / hybrid agent collaboration (LLM + non-LLM agents), enabling modular multi-agent pipelines that mix models, tools, and reasoning strategies.
 
 
+### 👁️ 4. **Awareness Network**
+**By Everest-AN**
+- **Code:** https://github.com/everest-an/Awareness-Market
+**What it adds:** A decentralized AI awareness market product built on LatentMAS research, enabling autonomous agent collaboration and memory sharing.
+
+
 **If your work extends LatentMAS, feel free to open a PR and we’ll feature it here! 🚀**
 
 
