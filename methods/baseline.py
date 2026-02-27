@@ -4,7 +4,7 @@ from models import ModelWrapper
 from prompts import build_agent_messages_single_agent
 from utils import extract_gsm8k_answer, normalize_answer, extract_markdown_python_block, run_with_timeout
 from experiment_logger import ExperimentLogger
-
+import torch
 
 class BaselineMethod:
     def __init__(
@@ -30,6 +30,7 @@ class BaselineMethod:
         self.task = args.task
         self.logger = logger
 
+    @torch.no_grad()
     def run_batch(self, items: List[Dict]) -> List[Dict]:
         if len(items) > self.generate_bs:
             raise ValueError("Batch size exceeds configured generate_bs")

@@ -8,6 +8,7 @@ from utils import extract_gsm8k_answer, normalize_answer, extract_markdown_pytho
 from experiment_logger import ExperimentLogger
 import argparse
 import pdb
+import torch
 
 class TextMASMethod:
     def __init__(
@@ -32,7 +33,8 @@ class TextMASMethod:
         self.method_name = "text_mas"
         self.task = args.task
         self.logger = logger
-        
+    
+    @torch.no_grad()
     def run_batch(self, items: List[Dict]) -> List[Dict]:
         if len(items) > self.generate_bs:
             raise ValueError("Batch size exceeds configured generate_bs")

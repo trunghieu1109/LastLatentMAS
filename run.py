@@ -117,6 +117,7 @@ def main():
     parser.add_argument("--device2", type=str, default="cuda:1")
     parser.add_argument("--tensor_parallel_size", type=int, default=1, help="How many GPUs vLLM should shard the model across")
     parser.add_argument("--gpu_memory_utilization", type=float, default=0.8, help="Target GPU memory utilization for vLLM")
+    parser.add_argument("--kv_flush_interval", type=int, default=30, help="Flush KV caches to disk every N queries (default: 30)")
 
     args = parser.parse_args()
     
@@ -133,6 +134,7 @@ def main():
         base_dir=os.path.join(os.path.dirname(os.path.abspath(__file__)), "experiment_logs"),
         task=args.task,
         args=args,
+        kv_flush_interval=args.kv_flush_interval,
     )
     
     start_time = time.time()
@@ -264,11 +266,17 @@ def main():
         "avg_total_tokens_per_query": round(total_tokens / num_queries, 2),
     }
 
+    # Wait for any background KV-cache writes to finish
+    logger.flush_kv_cache_queue()
+
     # Save all per-query results (predictions, agent traces, etc.)
     logger.save_results(preds)
 
     # Save summary to experiment log
     logger.save_summary(summary)
+
+    # Stop the background writer thread
+    logger.shutdown()
 
     # Load results in JSON format
     print(

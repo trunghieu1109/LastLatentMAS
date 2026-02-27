@@ -98,6 +98,8 @@ class LatentMASMethod:
                 query_indices.append(self.logger.next_query_index())
 
         agent_idx_counter = 0
+        accumulated_agent_names: List[str] = []  # track agents for KV cache metadata
+        last_past_kv = None  # will hold the final accumulated KV cache
         for agent in self.agents:
 
             if self.args.prompt == "sequential":
@@ -172,13 +174,9 @@ class LatentMASMethod:
                             agent_name=agent.name,
                             trace=trace_entry,
                         )
-                        self.logger.save_kv_cache(
-                            query_idx=query_indices[idx],
-                            agent_idx=agent_idx_counter,
-                            agent_name=agent.name,
-                            past_key_values=past_kv,
-                            batch_idx=idx,
-                        )
+
+                accumulated_agent_names.append(agent.name)
+                last_past_kv = past_kv  # update reference to latest accumulated cache
 
             else:
 
@@ -235,16 +233,26 @@ class LatentMASMethod:
                             agent_name=agent.name,
                             trace=trace_entry,
                         )
-                        self.logger.save_kv_cache(
-                            query_idx=query_indices[idx],
-                            agent_idx=agent_idx_counter,
-                            agent_name=agent.name,
-                            past_key_values=judger_past_kv,
-                            batch_idx=idx,
-                        )
+
+                accumulated_agent_names.append(agent.name)
+                last_past_kv = judger_past_kv  # judger cache includes all prior caches
 
 
             agent_idx_counter += 1
+
+        # Save accumulated KV cache once per query (after the last agent)
+        if self.logger and last_past_kv is not None:
+            for idx in range(batch_size):
+                self.logger.save_kv_cache_accumulated(
+                    query_idx=query_indices[idx],
+                    agent_names=accumulated_agent_names,
+                    past_key_values=last_past_kv,
+                    batch_idx=idx,
+                )
+
+        # Free GPU memory between batches
+        del past_kv, last_past_kv
+        torch.cuda.empty_cache()
 
         results: List[Dict] = []
         for idx, item in enumerate(items):
@@ -302,6 +310,7 @@ class LatentMASMethod:
             )
         return results
     
+    @torch.no_grad()
     def run_batch_vllm(self, items: List[Dict]) -> List[Dict]:
         if len(items) > self.generate_bs:
             raise ValueError("Batch size exceeds configured generate_bs")
@@ -319,6 +328,7 @@ class LatentMASMethod:
 
         agent_idx_counter = 0
         embedding_record = []
+        accumulated_agent_names: List[str] = []  # track agents for KV cache metadata
         for agent in self.agents:
             
             if self.args.prompt == "sequential":
@@ -404,13 +414,8 @@ class LatentMASMethod:
                             agent_name=agent.name,
                             trace=trace_entry,
                         )
-                        self.logger.save_kv_cache(
-                            query_idx=query_indices[idx],
-                            agent_idx=agent_idx_counter,
-                            agent_name=agent.name,
-                            past_key_values=past_kv,
-                            batch_idx=idx,
-                        )
+
+                accumulated_agent_names.append(agent.name)
 
             else:
                 
@@ -505,10 +510,27 @@ class LatentMASMethod:
                             agent_name=agent.name,
                             trace=trace_entry,
                         )
-                        # vLLM path: no HF KV cache for judger
+
+                accumulated_agent_names.append(agent.name)
 
 
             agent_idx_counter += 1
+
+        # Save accumulated KV cache once per query (after the last agent)
+        # In the vLLM path, the judger uses vLLM so there's no HF KV cache
+        # for it. We save the accumulated HF past_kv from the non-judger agents.
+        if self.logger and past_kv is not None:
+            for idx in range(batch_size):
+                self.logger.save_kv_cache_accumulated(
+                    query_idx=query_indices[idx],
+                    agent_names=accumulated_agent_names,
+                    past_key_values=past_kv,
+                    batch_idx=idx,
+                )
+
+        # Free GPU memory between batches
+        del past_kv, embedding_record
+        torch.cuda.empty_cache()
 
         results: List[Dict] = []
         for idx, item in enumerate(items):
