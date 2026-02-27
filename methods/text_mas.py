@@ -1,10 +1,11 @@
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from . import default_agents
 from models import ModelWrapper
 # from prompts import build_agent_messages, build_agent_messages_v6, build_agent_messages_v6_text_mas
 from prompts import build_agent_messages_hierarchical_text_mas, build_agent_messages_sequential_text_mas
 from utils import extract_gsm8k_answer, normalize_answer, extract_markdown_python_block, run_with_timeout
+from experiment_logger import ExperimentLogger
 import argparse
 import pdb
 
@@ -18,6 +19,7 @@ class TextMASMethod:
         top_p: float = 0.95,
         generate_bs: int = 1,
         args: argparse.Namespace = None,
+        logger: Optional[ExperimentLogger] = None,
     ) -> None:
         self.model = model
         self.max_new_tokens_each = max_new_tokens_each
@@ -29,17 +31,26 @@ class TextMASMethod:
         self.args = args
         self.method_name = "text_mas"
         self.task = args.task
+        self.logger = logger
         
     def run_batch(self, items: List[Dict]) -> List[Dict]:
         if len(items) > self.generate_bs:
             raise ValueError("Batch size exceeds configured generate_bs")
 
         batch_size = len(items)
+
+        # Allocate query indices for logging
+        query_indices = []
+        if self.logger:
+            for _ in range(batch_size):
+                query_indices.append(self.logger.next_query_index())
+
         contexts = ["" for _ in range(batch_size)]
         history_contexts = ["" for _ in range(batch_size)]
         agent_traces: List[List[Dict]] = [[] for _ in range(batch_size)]
         final_texts = ["" for _ in range(batch_size)]
 
+        agent_idx_counter = 0
         for agent in self.agents:
 
             if self.args.prompt == "hierarchical":
@@ -113,6 +124,8 @@ class TextMASMethod:
                     final_texts[idx] = text_out
                 mask = attention_mask[idx].bool()
                 trimmed_ids = input_ids[idx][mask].to("cpu").tolist()
+                input_token_count = len(trimmed_ids)
+                output_token_count = len(self.model.tokenizer.encode(text_out, add_special_tokens=False))
                 agent_traces[idx].append(
                     {
                         "name": agent.name,
@@ -121,9 +134,21 @@ class TextMASMethod:
                         "input_ids": trimmed_ids,
                         "input_tokens": tokens_batch[idx],
                         "output": text_out,
+                        "input_token_count": input_token_count,
+                        "output_token_count": output_token_count,
                     }
                 )
-            # import pdb; pdb.set_trace()
+
+                # Save agent trace (input/output only, no KV cache)
+                if self.logger:
+                    self.logger.save_agent_trace(
+                        query_idx=query_indices[idx],
+                        agent_idx=agent_idx_counter,
+                        agent_name=agent.name,
+                        trace=agent_traces[idx][-1],
+                    )
+
+            agent_idx_counter += 1
 
         results: List[Dict] = []
         for idx, item in enumerate(items):
@@ -162,6 +187,9 @@ class TextMASMethod:
                 ok = (pred == gold) if (pred and gold) else False
                 error_msg = None
 
+            query_input_tokens = sum(a.get("input_token_count", 0) for a in agent_traces[idx])
+            query_output_tokens = sum(a.get("output_token_count", 0) for a in agent_traces[idx])
+
             results.append(
                 {
                     "question": item["question"],
@@ -172,6 +200,9 @@ class TextMASMethod:
                     "raw_prediction": final_text,
                     "agents": agent_traces[idx],
                     "correct": ok,
+                    "query_total_input_tokens": query_input_tokens,
+                    "query_total_output_tokens": query_output_tokens,
+                    "query_total_tokens": query_input_tokens + query_output_tokens,
                 }
             )
         return results

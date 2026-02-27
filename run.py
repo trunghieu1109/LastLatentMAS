@@ -90,7 +90,7 @@ def main():
     parser.add_argument("--method", choices=["baseline", "text_mas", "latent_mas"], required=True,
                         help="Which multi-agent method to run: 'baseline', 'text_mas', or 'latent_mas'.")
     parser.add_argument("--model_name", type=str, required=True,
-                        choices=["Qwen/Qwen3-4B", "Qwen/Qwen3-4B", "Qwen/Qwen3-14B"],
+                        choices=["Qwen/Qwen3-0.6B", "Qwen/Qwen3-4B", "Qwen/Qwen3-14B"],
                         help="Model choices to use for experiments (e.g. 'Qwen/Qwen3-14B').")
     parser.add_argument("--max_samples", type=int, default=-1, help="Number of questions to evaluate; set -1 to use all samples.")
     parser.add_argument("--task", choices=["gsm8k", "aime2024", "aime2025", "gpqa", "arc_easy", "arc_challenge", "mbppplus", 'humanevalplus', 'medqa'], default="gsm8k",
@@ -104,7 +104,7 @@ def main():
     parser.add_argument("--latent_steps", type=int, default=0, help="Number of latent steps for LatentMAS method")
     parser.add_argument("--temperature", type=float, default=0.6)
     parser.add_argument("--top_p", type=float, default=0.95)
-    parser.add_argument("--generate_bs", type=int, default=20, help="Batch size for generation")
+    parser.add_argument("--generate_bs", type=int, default=5, help="Batch size for generation")
     parser.add_argument("--text_mas_context_length", type=int, default=-1, help="TextMAS context length limit")
     parser.add_argument("--think", action="store_true", help="Manually add think token in the prompt for LatentMAS")
     parser.add_argument("--latent_space_realign", action="store_true")
@@ -150,7 +150,8 @@ def main():
             **common_kwargs,
             generate_bs=args.generate_bs,
             use_vllm=args.use_vllm,
-            args=args
+            args=args,
+            logger=logger,
         )
     elif args.method == "text_mas":
         method = TextMASMethod(
@@ -159,6 +160,7 @@ def main():
             **common_kwargs,
             generate_bs=args.generate_bs,
             args=args,
+            logger=logger,
         )
     elif args.method == 'latent_mas':
         method = LatentMASMethod(
@@ -236,7 +238,13 @@ def main():
     total_time = time.time() - start_time
 
     acc, correct = evaluate(preds)
-    
+
+    # Aggregate token usage stats
+    total_input_tokens = sum(p.get("query_total_input_tokens", 0) for p in preds)
+    total_output_tokens = sum(p.get("query_total_output_tokens", 0) for p in preds)
+    total_tokens = total_input_tokens + total_output_tokens
+    num_queries = len(preds) if preds else 1
+
     # Run summary
     summary = {
         "method": args.method,
@@ -248,6 +256,12 @@ def main():
         "correct": correct,
         "total_time_sec": round(total_time, 4),
         "time_per_sample_sec": round(total_time / args.max_samples, 4),
+        "total_input_tokens": total_input_tokens,
+        "total_output_tokens": total_output_tokens,
+        "total_tokens": total_tokens,
+        "avg_input_tokens_per_query": round(total_input_tokens / num_queries, 2),
+        "avg_output_tokens_per_query": round(total_output_tokens / num_queries, 2),
+        "avg_total_tokens_per_query": round(total_tokens / num_queries, 2),
     }
 
     # Save all per-query results (predictions, agent traces, etc.)

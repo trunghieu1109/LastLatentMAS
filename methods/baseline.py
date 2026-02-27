@@ -1,8 +1,9 @@
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from models import ModelWrapper
 from prompts import build_agent_messages_single_agent
 from utils import extract_gsm8k_answer, normalize_answer, extract_markdown_python_block, run_with_timeout
+from experiment_logger import ExperimentLogger
 
 
 class BaselineMethod:
@@ -16,6 +17,7 @@ class BaselineMethod:
         generate_bs: int = 1,
         use_vllm: bool = False,
         args=None,
+        logger: Optional[ExperimentLogger] = None,
     ) -> None:
         self.model = model
         self.max_new_tokens = max_new_tokens
@@ -26,10 +28,20 @@ class BaselineMethod:
         self.method_name = "baseline"
         self.args = args
         self.task = args.task
+        self.logger = logger
 
     def run_batch(self, items: List[Dict]) -> List[Dict]:
         if len(items) > self.generate_bs:
             raise ValueError("Batch size exceeds configured generate_bs")
+
+        batch_size = len(items)
+
+        # Allocate query indices for logging
+        query_indices = []
+        if self.logger:
+            for _ in range(batch_size):
+                query_indices.append(self.logger.next_query_index())
+
         batch_messages = [
             build_agent_messages_single_agent(question=item["question"], args=self.args)
             for item in items
@@ -95,6 +107,8 @@ class BaselineMethod:
             
             mask = attention_mask[idx].bool()
             trimmed_ids = input_ids[idx][mask].to("cpu").tolist()
+            input_token_count = len(trimmed_ids)
+            output_token_count = len(self.model.tokenizer.encode(generated_text, add_special_tokens=False))
             agent_trace = {
                 "name": "SingleAgent",
                 "role": "singleagent",
@@ -102,7 +116,22 @@ class BaselineMethod:
                 "input_ids": trimmed_ids,
                 "input_tokens": tokens_batch[idx],
                 "output": generated_text,
+                "input_token_count": input_token_count,
+                "output_token_count": output_token_count,
             }
+
+            # Save agent trace (input/output only, no KV cache)
+            if self.logger:
+                self.logger.save_agent_trace(
+                    query_idx=query_indices[idx],
+                    agent_idx=0,
+                    agent_name="SingleAgent",
+                    trace=agent_trace,
+                )
+
+            query_input_tokens = input_token_count
+            query_output_tokens = output_token_count
+
             results.append(
                 {
                     "question": item["question"],
@@ -112,6 +141,9 @@ class BaselineMethod:
                     "raw_prediction": generated_text,
                     "agents": [agent_trace],
                     "correct": ok,
+                    "query_total_input_tokens": query_input_tokens,
+                    "query_total_output_tokens": query_output_tokens,
+                    "query_total_tokens": query_input_tokens + query_output_tokens,
                 }
             )
         return results

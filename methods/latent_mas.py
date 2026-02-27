@@ -160,6 +160,8 @@ class LatentMASMethod:
                         "input_tokens": wrapped_tokens_batch[idx],
                         "latent_steps": self.latent_steps,
                         "output": "",
+                        "input_token_count": len(trimmed_ids),
+                        "output_token_count": 0,
                     }
                     agent_traces[idx].append(trace_entry)
 
@@ -212,6 +214,8 @@ class LatentMASMethod:
                     final_texts[idx] = final_text
                     mask = judger_mask[idx].bool()
                     trimmed_ids = judger_ids[idx][mask].to("cpu").tolist()
+                    input_token_count = len(trimmed_ids)
+                    output_token_count = len(self.model.tokenizer.encode(final_text, add_special_tokens=False))
                     trace_entry = {
                         "name": agent.name,
                         "role": agent.role,
@@ -219,6 +223,8 @@ class LatentMASMethod:
                         "input_ids": trimmed_ids,
                         "input_tokens": judger_tokens_batch[idx],
                         "output": final_text,
+                        "input_token_count": input_token_count,
+                        "output_token_count": output_token_count,
                     }
                     agent_traces[idx].append(trace_entry)
 
@@ -277,6 +283,9 @@ class LatentMASMethod:
                 ok = (pred == gold) if (pred and gold) else False
                 error_msg = None
             
+            query_input_tokens = sum(a.get("input_token_count", 0) for a in agent_traces[idx])
+            query_output_tokens = sum(a.get("output_token_count", 0) for a in agent_traces[idx])
+
             results.append(
                 {
                     "question": item["question"],
@@ -286,6 +295,9 @@ class LatentMASMethod:
                     "raw_prediction": final_text,
                     "agents": agent_traces[idx],
                     "correct": ok,
+                    "query_total_input_tokens": query_input_tokens,
+                    "query_total_output_tokens": query_output_tokens,
+                    "query_total_tokens": query_input_tokens + query_output_tokens,
                 }
             )
         return results
@@ -380,6 +392,8 @@ class LatentMASMethod:
                         "input_tokens": wrapped_tokens_batch[idx],
                         "latent_steps": self.latent_steps,
                         "output": "",
+                        "input_token_count": len(trimmed_ids),
+                        "output_token_count": 0,
                     }
                     agent_traces[idx].append(trace_entry)
 
@@ -472,11 +486,15 @@ class LatentMASMethod:
                 for idx in range(batch_size):
                     text_out = generated_texts[idx].strip()
                     final_texts[idx] = text_out
+                    input_token_count = len(self.model.tokenizer.encode(judger_prompts[idx], add_special_tokens=False))
+                    output_token_count = len(self.model.tokenizer.encode(text_out, add_special_tokens=False))
                     trace_entry = {
                         "name": agent.name,
                         "role": agent.role,
                         "input": judger_prompts[idx],
                         "output": text_out,
+                        "input_token_count": input_token_count,
+                        "output_token_count": output_token_count,
                     }
                     agent_traces[idx].append(trace_entry)
 
@@ -498,6 +516,9 @@ class LatentMASMethod:
             pred = normalize_answer(extract_gsm8k_answer(final_text))
             gold = item["gold"]
             ok = (pred == gold) if (pred and gold) else False
+            query_input_tokens = sum(a.get("input_token_count", 0) for a in agent_traces[idx])
+            query_output_tokens = sum(a.get("output_token_count", 0) for a in agent_traces[idx])
+
             results.append(
                 {
                     "question": item["question"],
@@ -507,6 +528,9 @@ class LatentMASMethod:
                     "raw_prediction": final_text,
                     "agents": agent_traces[idx],
                     "correct": ok,
+                    "query_total_input_tokens": query_input_tokens,
+                    "query_total_output_tokens": query_output_tokens,
+                    "query_total_tokens": query_input_tokens + query_output_tokens,
                 }
             )
         return results
