@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 from typing import Dict, List, Tuple
 
 from tqdm import tqdm
@@ -20,6 +21,7 @@ from methods.latent_mas import LatentMASMethod
 from methods.text_mas import TextMASMethod
 from models import ModelWrapper
 from utils import auto_device, set_seed
+from experiment_logger import ExperimentLogger
 import time
 
 
@@ -114,7 +116,7 @@ def main():
     parser.add_argument("--use_second_HF_model", action="store_true", help="Use a second HF model for latent generation in latent_mas")
     parser.add_argument("--device2", type=str, default="cuda:1")
     parser.add_argument("--tensor_parallel_size", type=int, default=1, help="How many GPUs vLLM should shard the model across")
-    parser.add_argument("--gpu_memory_utilization", type=float, default=0.9, help="Target GPU memory utilization for vLLM")
+    parser.add_argument("--gpu_memory_utilization", type=float, default=0.8, help="Target GPU memory utilization for vLLM")
 
     args = parser.parse_args()
     
@@ -125,6 +127,13 @@ def main():
     set_seed(args.seed)
     device = auto_device(args.device)
     model = ModelWrapper(args.model_name, device, use_vllm=args.use_vllm, args=args)
+
+    # --- Create experiment logger ---
+    logger = ExperimentLogger(
+        base_dir=os.path.join(os.path.dirname(os.path.abspath(__file__)), "experiment_logs"),
+        task=args.task,
+        args=args,
+    )
     
     start_time = time.time()
 
@@ -159,6 +168,7 @@ def main():
             **common_kwargs,
             generate_bs=args.generate_bs, 
             args=args,
+            logger=logger,
         )
 
     preds: List[Dict] = []
@@ -227,20 +237,29 @@ def main():
 
     acc, correct = evaluate(preds)
     
+    # Run summary
+    summary = {
+        "method": args.method,
+        "model": args.model_name,
+        "split": args.split,
+        "seed": args.seed,
+        "max_samples": args.max_samples,
+        "accuracy": acc,
+        "correct": correct,
+        "total_time_sec": round(total_time, 4),
+        "time_per_sample_sec": round(total_time / args.max_samples, 4),
+    }
+
+    # Save all per-query results (predictions, agent traces, etc.)
+    logger.save_results(preds)
+
+    # Save summary to experiment log
+    logger.save_summary(summary)
+
     # Load results in JSON format
     print(
         json.dumps(
-            {
-                "method": args.method,
-                "model": args.model_name,
-                "split": args.split,
-                "seed": args.seed,
-                "max_samples": args.max_samples,
-                "accuracy": acc,
-                "correct": correct,
-                "total_time_sec": round(total_time,4),
-                "time_per_sample_sec": round(total_time / args.max_samples, 4),
-            },
+            summary,
             ensure_ascii=False,
         )
     )

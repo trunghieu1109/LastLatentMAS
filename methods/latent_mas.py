@@ -4,6 +4,7 @@ from . import default_agents
 from models import ModelWrapper, _past_length
 from prompts import build_agent_message_sequential_latent_mas, build_agent_message_hierarchical_latent_mas
 from utils import extract_gsm8k_answer, normalize_answer, extract_markdown_python_block, run_with_timeout
+from experiment_logger import ExperimentLogger
 import torch
 import argparse
 from vllm import SamplingParams
@@ -25,6 +26,7 @@ class LatentMASMethod:
         top_p: float = 0.95,
         generate_bs: int = 1,
         args: argparse.Namespace = None,
+        logger: Optional[ExperimentLogger] = None,
     ) -> None:
         self.args = args
         self.model = model
@@ -39,6 +41,7 @@ class LatentMASMethod:
         self.HF_device = args.device2
         self.latent_only = bool(getattr(args, "latent_only", False)) if args else False
         self.sequential_info_only = bool(getattr(args, "sequential_info_only", False)) if args else False
+        self.logger = logger
 
         if self.latent_only:
             self.sequential_info_only = True
@@ -88,6 +91,13 @@ class LatentMASMethod:
         agent_traces: List[List[Dict]] = [[] for _ in range(batch_size)]
         final_texts = ["" for _ in range(batch_size)]
 
+        # Allocate query indices for logging
+        query_indices = []
+        if self.logger:
+            for _ in range(batch_size):
+                query_indices.append(self.logger.next_query_index())
+
+        agent_idx_counter = 0
         for agent in self.agents:
 
             if self.args.prompt == "sequential":
@@ -142,17 +152,32 @@ class LatentMASMethod:
                 for idx in range(batch_size):
                     mask = wrapped_mask[idx].bool()
                     trimmed_ids = wrapped_ids[idx][mask].to("cpu").tolist()
-                    agent_traces[idx].append(
-                        {
-                            "name": agent.name,
-                            "role": agent.role,
-                            "input": wrapped_prompts[idx],
-                            "input_ids": trimmed_ids,
-                            "input_tokens": wrapped_tokens_batch[idx],
-                            "latent_steps": self.latent_steps,
-                            "output": "",
-                        }
-                    )
+                    trace_entry = {
+                        "name": agent.name,
+                        "role": agent.role,
+                        "input": wrapped_prompts[idx],
+                        "input_ids": trimmed_ids,
+                        "input_tokens": wrapped_tokens_batch[idx],
+                        "latent_steps": self.latent_steps,
+                        "output": "",
+                    }
+                    agent_traces[idx].append(trace_entry)
+
+                    if self.logger:
+                        self.logger.save_agent_trace(
+                            query_idx=query_indices[idx],
+                            agent_idx=agent_idx_counter,
+                            agent_name=agent.name,
+                            trace=trace_entry,
+                        )
+                        self.logger.save_kv_cache(
+                            query_idx=query_indices[idx],
+                            agent_idx=agent_idx_counter,
+                            agent_name=agent.name,
+                            past_key_values=past_kv,
+                            batch_idx=idx,
+                        )
+
             else:
 
                 past_for_decoding = past_kv if self.latent_steps > 0 else None
@@ -174,7 +199,7 @@ class LatentMASMethod:
                 for ids_row, mask_row in zip(judger_ids, judger_mask):
                     active_ids = ids_row[mask_row.bool()].tolist()
                     judger_tokens_batch.append(self.model.tokenizer.convert_ids_to_tokens(active_ids))
-                generated_batch, _ = self.model.generate_text_batch(
+                generated_batch, judger_past_kv = self.model.generate_text_batch(
                     judger_ids,
                     judger_mask,
                     max_new_tokens=self.judger_max_new_tokens,
@@ -187,16 +212,33 @@ class LatentMASMethod:
                     final_texts[idx] = final_text
                     mask = judger_mask[idx].bool()
                     trimmed_ids = judger_ids[idx][mask].to("cpu").tolist()
-                    agent_traces[idx].append(
-                        {
-                            "name": agent.name,
-                            "role": agent.role,
-                            "input": judger_prompts[idx],
-                            "input_ids": trimmed_ids,
-                            "input_tokens": judger_tokens_batch[idx],
-                            "output": final_text,
-                        }
-                    )
+                    trace_entry = {
+                        "name": agent.name,
+                        "role": agent.role,
+                        "input": judger_prompts[idx],
+                        "input_ids": trimmed_ids,
+                        "input_tokens": judger_tokens_batch[idx],
+                        "output": final_text,
+                    }
+                    agent_traces[idx].append(trace_entry)
+
+                    if self.logger:
+                        self.logger.save_agent_trace(
+                            query_idx=query_indices[idx],
+                            agent_idx=agent_idx_counter,
+                            agent_name=agent.name,
+                            trace=trace_entry,
+                        )
+                        self.logger.save_kv_cache(
+                            query_idx=query_indices[idx],
+                            agent_idx=agent_idx_counter,
+                            agent_name=agent.name,
+                            past_key_values=judger_past_kv,
+                            batch_idx=idx,
+                        )
+
+
+            agent_idx_counter += 1
 
         results: List[Dict] = []
         for idx, item in enumerate(items):
@@ -257,6 +299,13 @@ class LatentMASMethod:
         agent_traces: List[List[Dict]] = [[] for _ in range(batch_size)]
         final_texts = ["" for _ in range(batch_size)]
 
+        # Allocate query indices for logging
+        query_indices = []
+        if self.logger:
+            for _ in range(batch_size):
+                query_indices.append(self.logger.next_query_index())
+
+        agent_idx_counter = 0
         embedding_record = []
         for agent in self.agents:
             
@@ -323,17 +372,32 @@ class LatentMASMethod:
                 for idx in range(batch_size):
                     mask = wrapped_mask[idx].bool()
                     trimmed_ids = wrapped_ids[idx][mask].to("cpu").tolist()
-                    agent_traces[idx].append(
-                        {
-                            "name": agent.name,
-                            "role": agent.role,
-                            "input": wrapped_prompts[idx],
-                            "input_ids": trimmed_ids,
-                            "input_tokens": wrapped_tokens_batch[idx],
-                            "latent_steps": self.latent_steps,
-                            "output": "",
-                        }
-                    )
+                    trace_entry = {
+                        "name": agent.name,
+                        "role": agent.role,
+                        "input": wrapped_prompts[idx],
+                        "input_ids": trimmed_ids,
+                        "input_tokens": wrapped_tokens_batch[idx],
+                        "latent_steps": self.latent_steps,
+                        "output": "",
+                    }
+                    agent_traces[idx].append(trace_entry)
+
+                    if self.logger:
+                        self.logger.save_agent_trace(
+                            query_idx=query_indices[idx],
+                            agent_idx=agent_idx_counter,
+                            agent_name=agent.name,
+                            trace=trace_entry,
+                        )
+                        self.logger.save_kv_cache(
+                            query_idx=query_indices[idx],
+                            agent_idx=agent_idx_counter,
+                            agent_name=agent.name,
+                            past_key_values=past_kv,
+                            batch_idx=idx,
+                        )
+
             else:
                 
                 # A stack of [B, L_i, H]
@@ -408,15 +472,25 @@ class LatentMASMethod:
                 for idx in range(batch_size):
                     text_out = generated_texts[idx].strip()
                     final_texts[idx] = text_out
-                    agent_traces[idx].append(
-                        {
-                            "name": agent.name,
-                            "role": agent.role,
-                            "input": judger_prompts[idx],
-                            "output": text_out,
-                        }
-                    )
+                    trace_entry = {
+                        "name": agent.name,
+                        "role": agent.role,
+                        "input": judger_prompts[idx],
+                        "output": text_out,
+                    }
+                    agent_traces[idx].append(trace_entry)
 
+                    if self.logger:
+                        self.logger.save_agent_trace(
+                            query_idx=query_indices[idx],
+                            agent_idx=agent_idx_counter,
+                            agent_name=agent.name,
+                            trace=trace_entry,
+                        )
+                        # vLLM path: no HF KV cache for judger
+
+
+            agent_idx_counter += 1
 
         results: List[Dict] = []
         for idx, item in enumerate(items):
