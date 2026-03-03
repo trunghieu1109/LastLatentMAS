@@ -108,6 +108,9 @@ def main():
     parser.add_argument("--text_mas_context_length", type=int, default=-1, help="TextMAS context length limit")
     parser.add_argument("--think", action="store_true", help="Manually add think token in the prompt for LatentMAS")
     parser.add_argument("--latent_space_realign", action="store_true")
+    parser.add_argument("--accumulate_latent", action="store_true",
+                        help="Accumulate only latent thoughts across agents in KV cache, stripping input tokens. "
+                             "Agent N sees latent thoughts of agents 1..N-1 but not their input prompts.")
     parser.add_argument("--seed", type=int, default=42)
 
     # vLLM support

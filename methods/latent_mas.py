@@ -41,6 +41,7 @@ class LatentMASMethod:
         self.HF_device = args.device2
         self.latent_only = bool(getattr(args, "latent_only", False)) if args else False
         self.sequential_info_only = bool(getattr(args, "sequential_info_only", False)) if args else False
+        self.accumulate_latent = bool(getattr(args, "accumulate_latent", False)) if args else False
         self.logger = logger
 
         if self.latent_only:
@@ -80,6 +81,51 @@ class LatentMASMethod:
             else:
                 trimmed_layers.append(layer)
         return tuple(trimmed_layers)
+
+    def _strip_input_from_past(
+        self,
+        past_kv: Optional[Tuple],
+        input_start: int,
+        input_end: int,
+    ) -> Optional[Tuple]:
+        """Remove input token entries at positions [input_start, input_end) from KV cache,
+        keeping latent tokens before and after. This enables accumulating only latent
+        thoughts across agents while discarding input token KV entries.
+
+        Args:
+            past_kv: The KV cache tuple (or Cache object).
+            input_start: Start position of input tokens to remove (inclusive).
+            input_end: End position of input tokens to remove (exclusive).
+
+        Returns:
+            KV cache with input token entries stripped out.
+        """
+        if past_kv is None or input_start >= input_end:
+            return past_kv
+
+        def _strip_tensor(t: torch.Tensor) -> torch.Tensor:
+            # KV tensors have shape [..., seq_len, head_dim]
+            left = t[..., :input_start, :]
+            right = t[..., input_end:, :]
+            return torch.cat([left, right], dim=-2).contiguous()
+
+        if Cache is not None and isinstance(past_kv, Cache):
+            legacy = past_kv.to_legacy_cache()
+            stripped = tuple(
+                tuple(_strip_tensor(t) for t in layer)
+                for layer in legacy
+            )
+            return past_kv.__class__.from_legacy_cache(stripped)
+
+        stripped_layers = []
+        for layer in past_kv:
+            if isinstance(layer, tuple):
+                stripped_layers.append(tuple(_strip_tensor(t) for t in layer))
+            elif torch.is_tensor(layer):
+                stripped_layers.append(_strip_tensor(layer))
+            else:
+                stripped_layers.append(layer)
+        return tuple(stripped_layers)
 
     @torch.no_grad()
     def run_batch(self, items: List[Dict]) -> List[Dict]:
@@ -145,7 +191,13 @@ class LatentMASMethod:
                     latent_steps=self.latent_steps,
                     past_key_values=past_kv,
                 )
-                if self.sequential_info_only or self.latent_only:
+                if self.accumulate_latent:
+                    # Strip input tokens from KV cache, keep accumulated latent thoughts
+                    input_len = wrapped_ids.shape[1]
+                    past_kv = self._strip_input_from_past(
+                        past_kv, prev_past_len, prev_past_len + input_len
+                    )
+                elif self.sequential_info_only or self.latent_only:
                     new_past_len = _past_length(past_kv)
                     tokens_added = new_past_len - prev_past_len
                     tokens_to_keep = self.latent_steps if self.latent_only else tokens_added
@@ -374,22 +426,34 @@ class LatentMASMethod:
                     latent_steps=self.latent_steps,
                     past_key_values=past_kv,
                 )
-                if self.sequential_info_only or self.latent_only:
-                    new_past_len = _past_length(past_kv)
-                    tokens_added = new_past_len - prev_past_len
-                    tokens_to_keep = self.latent_steps if self.latent_only else tokens_added
-                    past_kv = self._truncate_past(past_kv, tokens_to_keep)
-
-                if self.latent_only:
+                if self.accumulate_latent:
+                    # Strip input tokens from KV cache, keep accumulated latent thoughts
+                    input_len = wrapped_ids.shape[1]
+                    past_kv = self._strip_input_from_past(
+                        past_kv, prev_past_len, prev_past_len + input_len
+                    )
+                    # Only keep latent embeddings (strip input embeddings)
                     if self.latent_steps > 0:
                         previous_hidden_embedding = previous_hidden_embedding[:, -self.latent_steps:, :]
                     else:
                         previous_hidden_embedding = previous_hidden_embedding[:, 0:0, :]
+                elif self.sequential_info_only or self.latent_only:
+                    new_past_len = _past_length(past_kv)
+                    tokens_added = new_past_len - prev_past_len
+                    tokens_to_keep = self.latent_steps if self.latent_only else tokens_added
+                    past_kv = self._truncate_past(past_kv, tokens_to_keep)
+                    if self.latent_only:
+                        if self.latent_steps > 0:
+                            previous_hidden_embedding = previous_hidden_embedding[:, -self.latent_steps:, :]
+                        else:
+                            previous_hidden_embedding = previous_hidden_embedding[:, 0:0, :]
 
                 embedding_record.append(previous_hidden_embedding)
 
                 if self.sequential_info_only or self.latent_only:
                     embedding_record = embedding_record[-1:]
+                # accumulate_latent: do NOT truncate embedding_record,
+                # keep all agents' latent embeddings for accumulation
                 
                 for idx in range(batch_size):
                     mask = wrapped_mask[idx].bool()
