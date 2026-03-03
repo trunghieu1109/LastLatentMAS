@@ -7,111 +7,141 @@ def build_agent_message_sequential_latent_mas(role: str, question: str, context:
     assert "qwen" in args.model_name.lower(), "this prompt only for qwen models"
 
     if role == "planner":
-        user_prompt = f"""You are a Planner Agent. Given an input question, design a clear, step-by-step plan for how to solve the question.
+        user_content = f"""
+You are a Planner Agent. Given an input question, design a clear, step-by-step plan for how to solve the question.
 
-Question: {question}
+## Input Question:
+{question}
 
-Your outlined plan should be concise with a few bulletpoints for each step. Do not produce the final answer.
+Your outlined plan should be concise with a few bullet points for each step. Do not produce the final answer.
+
+## Format your response as follows:
+Planner Agent's Output:
+[Your detailed plan here]
+
 Now output your plan to solve the question below:
 """
-    
+
     elif role == "critic":
-        user_prompt = f"""
-Question: {question}
+        user_content = f"""
+You are a Critic Agent. You are provided with:
+(1) the original question, and
+(2) the Planner Agent's plan in text format.
 
-You are a Critic Agent to evaluate the correctness of the input plan for the given question and provide helpful feedback for improving the plan.
-The plan information is provided in latent KV representation format. Review the plan and question and output:
-(1) original plan contents
-(2) constructive feedback on the original plan.
+Your job is to carefully evaluate the correctness and completeness of the plan and provide helpful feedback.
 
-Format your response as follows:
+## Input Question:
+{question}
+
+## Format your response as follows:
+Critic Agent's Output:
 Original Plan: [Copy the provided Planner Agent's plan here]
 Feedback: [Your detailed feedback to improve the plan here]
 
 Now, output your response below:
 """
-    
+
     elif role == "refiner":
-        user_prompt = f"""
-Question: {question}
+        user_content = f"""
+You are a Refiner Agent. You are provided with:
+(1) the original question, and
+(2) the Planner Agent's plan together with Critic Agent's feedback in text format.
 
-You are a Refiner Agent to provide a refined step-by-step plan for solving the given question.
-You are provided with:
-(1) latent-format information: a previous plan with feedback
-(2) text-format information: the input question you need to solve.
+Your job is to incorporate the feedback and produce an improved, refined step-by-step plan.
 
-Based on the input, write a refined and improved plan to solve the question. Make sure your output plan is correct and concise.
+## Input Question:
+{question}
 
+## Format your response as follows:
+Refiner Agent's Output:
+[Your refined and improved plan here]
+
+Make sure your output plan is logically correct, concise, and sufficient to guide final problem solving.
 Now, output your refined plan below:
 """
-    
+
     elif role == "judger":
-        if args.task in ['gsm8k', 'aime2024', 'aime2025']:
-            user_prompt = f"""
+        task = getattr(args, "task", None)
+
+        if task in ["gsm8k", "aime2024", "aime2025"]:
+            user_content = f"""
 Target Question: {question}
 
-You are a helpful assistant. You are provided with latent information for reference and a target question to solve. 
+You are the final solver agent in a sequential multi-agent system (planner -> critic -> refiner -> solver).
+You are provided with the Refiner Agent's plan as reference.
 
-The latent information might contain irrelevant contents. Ignore it if it is not helpful for solving the target question.
+The plan might contain irrelevant or incorrect contents. Ignore them if they are not helpful for solving the target question.
 
-You must reason step-by-step to solve the provided Target Question without outputting other irrelevant information.
+You must reason step-by-step to solve the **provided Target Question** without outputting other irrelevant information.
 
 Now, reason step by step and output the final answer inside \\boxed{{YOUR_FINAL_ANSWER}}.
 """
-        
-        elif args.task in ["arc_easy", "arc_challenge", "gpqa", 'medqa']:
-            user_prompt = f"""
+
+        elif task in ["arc_easy", "arc_challenge", "gpqa", "medqa"]:
+            user_content = f"""
 Target Question: {question}
 
-You are a helpful assistant. You are provided with latent information for reference and a target question to solve. 
+You are the final solver agent in a sequential multi-agent system (planner -> critic -> refiner -> solver).
+You are provided with the Refiner Agent's plan as reference.
 
-The latent information might contain irrelevant contents. Ignore it if it is not helpful for solving the target question.
+The plan might contain irrelevant or incorrect contents. Ignore them if they are not helpful for solving the target question.
 
-You must reason step-by-step to solve the provided Target Question without outputting other irrelevant information.
+You must reason step-by-step to solve the **provided Target Question** without outputting other irrelevant information.
 Your final answer must be selected from A,B,C,D. For example \\boxed{{A}}. Do not add any other contents inside the box.
 
 Now, reason step by step and output the final answer inside \\boxed{{YOUR_FINAL_ANSWER}}.
 """
 
-        elif args.task in ["mbppplus", "humanevalplus"]:
-            user_prompt = f"""
+        elif task in ["mbppplus", "humanevalplus"]:
+            user_content = f"""
 Target Question: {question}
 
-You are a helpful assistant. You are provided with latent information for reference and a target question to solve.
+You are the final solver agent in a sequential multi-agent system (planner -> critic -> refiner -> solver).
+You are provided with the Refiner Agent's plan as reference.
 
-The latent information might contain irrelevant contents. Ignore it if it is not helpful for solving the target question.
+The plan might contain irrelevant or incorrect contents. Ignore them if they are not helpful for solving the target question.
 
-You must reason step-by-step to solve the provided Target Question without outputting other irrelevant information.
-You must put all python code as self-contained Python function in markdown code blocks. For example ```python
+You must reason step-by-step to solve the **provided Target Question** without outputting other irrelevant information.
+You must put all python code as self-contained Python function(s) in markdown code blocks. For example:
+```python
 import math
 def add(a, b):
-    return a + b```. Do not add any other contents inside the markdown code block.
-
-Now, reason step by step and output the final answer inside ```python
-YOUR_PYTHON_CODE
-```.
+    return a + b
+```
+Do not add any other contents inside the markdown code block.
 """
-
-        elif args.task in ["winogrande"]:
-            user_prompt = f"""
+            
+        elif task in ["winogrande"]:
+            user_content = f"""
 Target Question: {question}
 
-You are a helpful assistant. You are provided with latent information for reference and a target question to solve. 
+You are the final solver agent in a sequential multi-agent system (planner -> critic -> refiner -> solver).
+You are provided with the Refiner Agent's plan as reference.
 
-The latent information might contain irrelevant contents. Ignore it if it is not helpful for solving the target question.
+The plan might contain irrelevant or incorrect contents. Ignore them if they are not helpful for solving the target question.
 
-You must reason step-by-step to solve the provided Target Question without outputting other irrelevant information.
+You must reason step-by-step to solve the **provided Target Question** without outputting other irrelevant information.
 Your final answer must be selected from 1 and 2. For example \\boxed{{1}} or \\boxed{{2}}. Do not add any other contents inside the box.
 
 Now, reason step by step and output the final answer inside \\boxed{{YOUR_FINAL_ANSWER}}.
 """
+        else:
+            user_content = f"""
+Target Question: {question}
 
-        else: 
-            raise NotImplementedError(f"Task {args.task} not implemented in v5 judger prompt.")
-        
+You are the final solver agent in a sequential multi-agent system (planner -> critic -> refiner -> solver).
+You are provided with the Refiner Agent's plan as reference.
+
+The plan might contain irrelevant or incorrect contents. Ignore them if they are not helpful for solving the target question.
+
+You must reason step-by-step to solve the **provided Target Question** without outputting other irrelevant information.
+
+Now, reason step by step and present your final answer clearly at the end.
+"""
+
     return [
         {"role": "system", "content": system_message},
-        {"role": "user", "content": user_prompt},
+        {"role": "user", "content": user_content},
     ]
 
 
