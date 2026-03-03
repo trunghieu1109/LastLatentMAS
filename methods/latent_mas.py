@@ -43,6 +43,7 @@ class LatentMASMethod:
         self.sequential_info_only = bool(getattr(args, "sequential_info_only", False)) if args else False
         self.accumulate_latent = bool(getattr(args, "accumulate_latent", False)) if args else False
         self.logger = logger
+        self.save_kv = bool(getattr(args, "save_kv", False)) if args else False
 
         if self.latent_only:
             self.sequential_info_only = True
@@ -293,7 +294,7 @@ class LatentMASMethod:
             agent_idx_counter += 1
 
         # Save accumulated KV cache once per query (after the last agent)
-        if self.logger and last_past_kv is not None:
+        if self.logger and self.save_kv and last_past_kv is not None:
             for idx in range(batch_size):
                 self.logger.save_kv_cache_accumulated(
                     query_idx=query_indices[idx],
@@ -583,7 +584,7 @@ class LatentMASMethod:
         # Save accumulated KV cache once per query (after the last agent)
         # In the vLLM path, the judger uses vLLM so there's no HF KV cache
         # for it. We save the accumulated HF past_kv from the non-judger agents.
-        if self.logger and past_kv is not None:
+        if self.logger and self.save_kv and past_kv is not None:
             for idx in range(batch_size):
                 self.logger.save_kv_cache_accumulated(
                     query_idx=query_indices[idx],

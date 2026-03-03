@@ -27,6 +27,30 @@ def _past_length(past_key_values: Optional[Tuple]) -> int:
     return k.shape[-2]
 
 
+def _compute_max_memory(safety_margin_gb: float = 2.0) -> Dict[int, str]:
+    """Compute max_memory dict for device_map='auto' based on actual free GPU memory.
+
+    Call this AFTER any other frameworks (e.g. vLLM) have already allocated their
+    GPU memory so that the returned values reflect genuinely available VRAM.
+
+    Args:
+        safety_margin_gb: Extra headroom (in GiB) to leave free on each GPU
+            for KV caches, activations, and other dynamic allocations.
+
+    Returns:
+        Dict mapping GPU index -> available memory string, e.g. {0: '5.2GiB', 1: '22.0GiB'}
+    """
+    if not torch.cuda.is_available():
+        return {}
+    max_memory: Dict[int, str] = {}
+    for i in range(torch.cuda.device_count()):
+        free, total = torch.cuda.mem_get_info(i)
+        available_gb = (free / (1024 ** 3)) - safety_margin_gb
+        if available_gb > 0.5:  # only include GPUs with meaningful free memory
+            max_memory[i] = f"{available_gb:.1f}GiB"
+    return max_memory
+
+
 class ModelWrapper:
     def __init__(self, model_name: str, device: torch.device, use_vllm: bool = False, args = None):
         self.model_name = model_name
@@ -39,6 +63,8 @@ class ModelWrapper:
 
         # for ablation
         self.pre_aligned = None
+
+        self.device_map_auto = bool(getattr(args, "device_map_auto", False)) if args else False
 
         if self.use_vllm:
             
@@ -54,12 +80,29 @@ class ModelWrapper:
             
             use_second_hf = bool(getattr(args, "use_second_HF_model", False)) if args else False
             if use_second_hf:
-                self.HF_model = AutoModelForCausalLM.from_pretrained(
-                    model_name,
-                    torch_dtype=(torch.bfloat16 if torch.cuda.is_available() else torch.float32),
-                ).to(args.device2).eval() 
+                if self.device_map_auto:
+                    # Compute available memory AFTER vLLM has allocated on its GPU(s)
+                    max_memory = _compute_max_memory(safety_margin_gb=2.0)
+                    print(f"[HF Model] Using device_map='auto' with max_memory={max_memory}")
+                    self.HF_model = AutoModelForCausalLM.from_pretrained(
+                        model_name,
+                        torch_dtype=(torch.bfloat16 if torch.cuda.is_available() else torch.float32),
+                        device_map="auto",
+                        max_memory=max_memory,
+                    )
+                    self.HF_model.eval()
+                    # With device_map="auto", use the device of the first parameter
+                    self.HF_device = str(self.HF_model.device)
+                    print(f"[HF Model] Primary device: {self.HF_device}")
+                    if hasattr(self.HF_model, 'hf_device_map'):
+                        print(f"[HF Model] Device map: {self.HF_model.hf_device_map}")
+                else:
+                    self.HF_model = AutoModelForCausalLM.from_pretrained(
+                        model_name,
+                        torch_dtype=(torch.bfloat16 if torch.cuda.is_available() else torch.float32),
+                    ).to(args.device2).eval() 
+                    self.HF_device = args.device2
                 self.embedding_layer = self.HF_model.get_input_embeddings()
-                self.HF_device = args.device2
                 # if self.latent_space_realign:
                 self._ensure_latent_realign_matrix(self.HF_model, torch.device(self.HF_device), args)
             elif self.latent_space_realign:
@@ -71,13 +114,27 @@ class ModelWrapper:
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
         _ensure_pad_token(self.tokenizer)
         with torch.no_grad():
-            self.model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                torch_dtype=(torch.bfloat16 if torch.cuda.is_available() else torch.float32),
-            )
+            if self.device_map_auto and torch.cuda.device_count() > 1:
+                max_memory = _compute_max_memory(safety_margin_gb=2.0)
+                print(f"[HF Model] Using device_map='auto' with max_memory={max_memory}")
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    model_name,
+                    torch_dtype=(torch.bfloat16 if torch.cuda.is_available() else torch.float32),
+                    device_map="auto",
+                    max_memory=max_memory,
+                )
+                self.device = self.model.device
+                if hasattr(self.model, 'hf_device_map'):
+                    print(f"[HF Model] Device map: {self.model.hf_device_map}")
+            else:
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    model_name,
+                    torch_dtype=(torch.bfloat16 if torch.cuda.is_available() else torch.float32),
+                )
         if len(self.tokenizer) != self.model.get_input_embeddings().weight.shape[0]:
             self.model.resize_token_embeddings(len(self.tokenizer))
-        self.model.to(device)
+        if not self.device_map_auto or torch.cuda.device_count() <= 1:
+            self.model.to(device)
         self.model.eval()
         if hasattr(self.model.config, "use_cache"):
             self.model.config.use_cache = True

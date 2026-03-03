@@ -120,7 +120,11 @@ def main():
     parser.add_argument("--device2", type=str, default="cuda:1")
     parser.add_argument("--tensor_parallel_size", type=int, default=1, help="How many GPUs vLLM should shard the model across")
     parser.add_argument("--gpu_memory_utilization", type=float, default=0.8, help="Target GPU memory utilization for vLLM")
+    parser.add_argument("--device_map_auto", action="store_true",
+                        help="Use device_map='auto' for HF model to automatically distribute layers across GPUs. "
+                             "When vLLM uses part of GPU 0, the HF model will overflow onto GPU 0's remaining VRAM.")
     parser.add_argument("--kv_flush_interval", type=int, default=30, help="Flush KV caches to disk every N queries (default: 30)")
+    parser.add_argument("--save_kv", action="store_true", help="Enable saving KV caches to disk (latent_mas mode). Agent traces are always saved.")
 
     args = parser.parse_args()
     
@@ -270,7 +274,8 @@ def main():
     }
 
     # Wait for any background KV-cache writes to finish
-    logger.flush_kv_cache_queue()
+    if args.save_kv:
+        logger.flush_kv_cache_queue()
 
     # Save all per-query results (predictions, agent traces, etc.)
     logger.save_results(preds)
