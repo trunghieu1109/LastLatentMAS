@@ -108,11 +108,13 @@ class ModelWrapper:
             elif self.latent_space_realign:
                 raise ValueError("latent_space_realign requires --use_second_HF_model when using vLLM backend.")
             _ensure_pad_token(self.tokenizer)
+            self.tokenizer.padding_side = "left"
             return  # skip loading transformers model
 
         # fallback: normal transformers path
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
         _ensure_pad_token(self.tokenizer)
+        self.tokenizer.padding_side = "left"
         with torch.no_grad():
             if self.device_map_auto and torch.cuda.device_count() > 1:
                 max_memory = _compute_max_memory(safety_margin_gb=2.0)

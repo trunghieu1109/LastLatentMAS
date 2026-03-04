@@ -125,6 +125,7 @@ def main():
                              "When vLLM uses part of GPU 0, the HF model will overflow onto GPU 0's remaining VRAM.")
     parser.add_argument("--kv_flush_interval", type=int, default=30, help="Flush KV caches to disk every N queries (default: 30)")
     parser.add_argument("--save_kv", action="store_true", help="Enable saving KV caches to disk (latent_mas mode). Agent traces are always saved.")
+    parser.add_argument("--tag", type=str, default="", help="Tag prefix for experiment output directory, useful for labeling runs.")
 
     args = parser.parse_args()
     
@@ -137,10 +138,17 @@ def main():
     model = ModelWrapper(args.model_name, device, use_vllm=args.use_vllm, args=args)
 
     # --- Create experiment logger ---
+    # Build timestamp with optional tag prefix
+    from datetime import datetime
+    timestamp = datetime.utcnow().strftime("%Y-%m-%d_%H-%M-%S")
+    if args.tag:
+        timestamp = f"{args.tag}_{timestamp}"
+
     logger = ExperimentLogger(
         base_dir=os.path.join(os.path.dirname(os.path.abspath(__file__)), "experiment_logs"),
         task=args.task,
         args=args,
+        timestamp=timestamp,
         kv_flush_interval=args.kv_flush_interval,
     )
     
