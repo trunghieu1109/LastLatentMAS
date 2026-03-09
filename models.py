@@ -828,12 +828,18 @@ class ModelWrapper:
                         h_input_l  = h_input_l.to(device).float()
 
                         ae_device = next(ae.parameters()).device
-                        h_rec, _z, _gate = ae(
+                        h_rec, _z, gate = ae(
                             h_latent_l.to(ae_device),
                             h_input_l.to(ae_device),
                             normalize=True,
                         )
                         h_rec = h_rec.to(device)
+                        gate  = gate.to(device)
+
+                        # Masked Reconstruction: zero out garbage values
+                        # from unimportant features (gate ≈ 0), keeping only
+                        # well-reconstructed important features (gate ≈ 1).
+                        h_rec = gate * h_rec
 
                         # Align to embedding distribution
                         latent_vec = self._apply_latent_realignment(
