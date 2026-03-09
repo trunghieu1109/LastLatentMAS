@@ -15,6 +15,9 @@ env/
 .venv/
 .env/
 
+# Local config — contains secrets/paths; use .env.example as template
+.env
+
 # IDE
 .vscode/
 .idea/
@@ -31,6 +34,8 @@ Thumbs.db
 
 # Experiment logs
 experiment_logs/
+ae_checkpoints/
+ae_analysis/
 
 # Model caches
 *.pt

@@ -2,7 +2,7 @@
 def build_agent_message_sequential_latent_mas(role: str, question: str, context: str = "", method=None, args=None):
 
     system_message = "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
-
+    # print(method)
     assert method in ["latent_mas"], "this prompt only for latent_mas method"
     assert "qwen" in args.model_name.lower(), "this prompt only for qwen models"
 

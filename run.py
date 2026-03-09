@@ -1,7 +1,49 @@
 import argparse
 import json
 import os
+import shlex
 from typing import Dict, List, Tuple
+
+
+def _load_dotenv(path: str | None = None) -> None:
+    """Load key=value pairs from a .env file into os.environ.
+
+    Values already set in the environment (e.g. via shell export) are NOT
+    overridden — the .env file acts only as a fallback default.
+
+    Supports:
+      - Blank lines and lines starting with '#' (comments) are skipped.
+      - Optional 'export KEY=VALUE' prefix.
+      - Inline comments after the value (e.g. KEY=foo  # comment).
+      - Quoted values (single or double): KEY="hello world".
+    """
+    if path is None:
+        # Look for .env next to this script
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if not os.path.isfile(path):
+        return
+    with open(path) as fh:
+        for raw_line in fh:
+            line = raw_line.strip()
+            # Skip blanks and comments
+            if not line or line.startswith("#"):
+                continue
+            # Strip optional 'export ' prefix
+            if line.startswith("export "):
+                line = line[len("export "):].strip()
+            if "=" not in line:
+                continue
+            key, _, rest = line.partition("=")
+            key = key.strip()
+            # Strip inline comment (everything after unquoted ' #')
+            rest = rest.split(" #")[0].split("\t#")[0].strip()
+            # Strip surrounding quotes
+            if (rest.startswith('"') and rest.endswith('"')) or \
+               (rest.startswith("'") and rest.endswith("'")):
+                rest = rest[1:-1]
+            # Only set if not already in the environment
+            if key and key not in os.environ:
+                os.environ[key] = rest
 
 from tqdm import tqdm
 
@@ -17,8 +59,10 @@ from data import (
     load_medqa
 )
 from methods.baseline import BaselineMethod
-from methods.latent_mas import LatentMASMethod
+from methods.our_mas import LatentMASMethod
+# from methods.our_mas import ComLatMAS
 from methods.text_mas import TextMASMethod
+from methods.ae_trainer import AETrainer, AEConfig
 from models import ModelWrapper
 from utils import auto_device, set_seed
 from experiment_logger import ExperimentLogger
@@ -84,47 +128,142 @@ def process_batch(
 
 
 def main():
-    parser = argparse.ArgumentParser()
+    # Load .env before building the parser so env vars feed into defaults
+    _load_dotenv()
+
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+
+    # ------------------------------------------------------------------ #
+    # Helper: read a default from os.environ (populated from .env above)  #
+    # ------------------------------------------------------------------ #
+    def _env(key: str, default):
+        """Return os.environ[key] cast to the same type as *default*, or *default*."""
+        raw = os.environ.get(key)
+        if raw is None:
+            return default
+        if isinstance(default, bool):
+            return raw.lower() in ("1", "true", "yes")
+        try:
+            return type(default)(raw)
+        except (ValueError, TypeError):
+            return default
 
     # core args for experiments
-    parser.add_argument("--method", choices=["baseline", "text_mas", "latent_mas"], required=True,
-                        help="Which multi-agent method to run: 'baseline', 'text_mas', or 'latent_mas'.")
-    parser.add_argument("--model_name", type=str, required=True,
+    parser.add_argument("--method",
+                        choices=["baseline", "text_mas", "latent_mas", "com_mas",
+                                 "collect_and_train_ae"],
+                        default=_env("METHOD", None),
+                        required=(os.environ.get("METHOD") is None),
+                        help="Which multi-agent method to run. Use 'collect_and_train_ae' "
+                             "to collect hidden state data and train the Query-Aware AE.")
+    parser.add_argument("--model_name", type=str,
                         choices=["Qwen/Qwen3-0.6B", "Qwen/Qwen3-4B", "Qwen/Qwen3-14B"],
-                        help="Model choices to use for experiments (e.g. 'Qwen/Qwen3-14B').")
-    parser.add_argument("--max_samples", type=int, default=-1, help="Number of questions to evaluate; set -1 to use all samples.")
-    parser.add_argument("--task", choices=["gsm8k", "aime2024", "aime2025", "gpqa", "arc_easy", "arc_challenge", "mbppplus", 'humanevalplus', 'medqa'], default="gsm8k",
-                        help="Dataset/task to evaluate. Controls which loader is used.")
-    parser.add_argument("--prompt", type=str, choices=["sequential", "hierarchical"], default="sequential", help="Multi-agent system architecture: 'sequential' or 'hierarchical'.")
+                        default=_env("MODEL_NAME", None),
+                        required=(os.environ.get("MODEL_NAME") is None),
+                        help="HuggingFace model name.")
+    parser.add_argument("--max_samples", type=int,
+                        default=_env("MAX_SAMPLES", -1),
+                        help="Number of questions to evaluate; -1 = all.")
+    parser.add_argument("--task",
+                        choices=["gsm8k", "aime2024", "aime2025", "gpqa",
+                                 "arc_easy", "arc_challenge", "mbppplus",
+                                 "humanevalplus", "medqa"],
+                        default=_env("TASK", "gsm8k"),
+                        help="Dataset/task to evaluate.")
+    parser.add_argument("--prompt", type=str,
+                        choices=["sequential", "hierarchical"],
+                        default=_env("PROMPT", "sequential"),
+                        help="Multi-agent system architecture.")
 
     # other args
-    parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--split", type=str, default="test")
-    parser.add_argument("--max_new_tokens", type=int, default=4096)
-    parser.add_argument("--latent_steps", type=int, default=0, help="Number of latent steps for LatentMAS method")
-    parser.add_argument("--temperature", type=float, default=0.6)
-    parser.add_argument("--top_p", type=float, default=0.95)
-    parser.add_argument("--generate_bs", type=int, default=5, help="Batch size for generation")
-    parser.add_argument("--text_mas_context_length", type=int, default=-1, help="TextMAS context length limit")
-    parser.add_argument("--think", action="store_true", help="Manually add think token in the prompt for LatentMAS")
-    parser.add_argument("--latent_space_realign", action="store_true")
+    parser.add_argument("--device", type=str, default=_env("DEVICE", "cuda"))
+    parser.add_argument("--split", type=str, default=_env("SPLIT", "test"))
+    parser.add_argument("--max_new_tokens", type=int, default=_env("MAX_NEW_TOKENS", 4096))
+    parser.add_argument("--latent_steps", type=int, default=_env("LATENT_STEPS", 0),
+                        help="Number of latent steps for LatentMAS method.")
+    parser.add_argument("--temperature", type=float, default=_env("TEMPERATURE", 0.6))
+    parser.add_argument("--top_p", type=float, default=_env("TOP_P", 0.95))
+    parser.add_argument("--generate_bs", type=int, default=_env("GENERATE_BS", 5),
+                        help="Batch size for generation.")
+    parser.add_argument("--text_mas_context_length", type=int,
+                        default=_env("TEXT_MAS_CONTEXT_LENGTH", -1),
+                        help="TextMAS context length limit.")
+    parser.add_argument("--think", action="store_true",
+                        default=_env("THINK", False),
+                        help="Manually add <think> token in the prompt for LatentMAS.")
+    parser.add_argument("--latent_space_realign", action="store_true",
+                        default=_env("LATENT_SPACE_REALIGN", False))
     parser.add_argument("--accumulate_latent", action="store_true",
-                        help="Accumulate only latent thoughts across agents in KV cache, stripping input tokens. "
-                             "Agent N sees latent thoughts of agents 1..N-1 but not their input prompts.")
-    parser.add_argument("--seed", type=int, default=42)
+                        default=_env("ACCUMULATE_LATENT", False),
+                        help="Accumulate only latent thoughts across agents in KV cache.")
+    parser.add_argument("--seed", type=int, default=_env("SEED", 42))
 
     # vLLM support
-    parser.add_argument("--use_vllm", action="store_true", help="Use vLLM backend for generation")
-    parser.add_argument("--enable_prefix_caching", action="store_true", help="Enable prefix caching in vLLM for latent_mas")
-    parser.add_argument("--use_second_HF_model", action="store_true", help="Use a second HF model for latent generation in latent_mas")
-    parser.add_argument("--device2", type=str, default="cuda:1")
-    parser.add_argument("--tensor_parallel_size", type=int, default=1, help="How many GPUs vLLM should shard the model across")
-    parser.add_argument("--gpu_memory_utilization", type=float, default=0.8, help="Target GPU memory utilization for vLLM")
+    parser.add_argument("--use_vllm", action="store_true",
+                        default=_env("USE_VLLM", False),
+                        help="Use vLLM backend for generation.")
+    parser.add_argument("--enable_prefix_caching", action="store_true",
+                        default=_env("ENABLE_PREFIX_CACHING", False),
+                        help="Enable prefix caching in vLLM for latent_mas.")
+    parser.add_argument("--use_second_HF_model", action="store_true",
+                        default=_env("USE_SECOND_HF_MODEL", False),
+                        help="Use a second HF model for latent generation in latent_mas.")
+    parser.add_argument("--device2", type=str, default=_env("DEVICE2", "cuda:1"))
+    parser.add_argument("--tensor_parallel_size", type=int,
+                        default=_env("TENSOR_PARALLEL_SIZE", 1),
+                        help="How many GPUs vLLM should shard the model across.")
+    parser.add_argument("--gpu_memory_utilization", type=float,
+                        default=_env("GPU_MEMORY_UTILIZATION", 0.8),
+                        help="Target GPU memory utilization for vLLM.")
     parser.add_argument("--device_map_auto", action="store_true",
-                        help="Use device_map='auto' for HF model to automatically distribute layers across GPUs. "
-                             "When vLLM uses part of GPU 0, the HF model will overflow onto GPU 0's remaining VRAM.")
-    parser.add_argument("--kv_flush_interval", type=int, default=30, help="Flush KV caches to disk every N queries (default: 30)")
-    parser.add_argument("--save_kv", action="store_true", help="Enable saving KV caches to disk (latent_mas mode). Agent traces are always saved.")
+                        default=_env("DEVICE_MAP_AUTO", False),
+                        help="Use device_map='auto' for HF model.")
+    parser.add_argument("--kv_flush_interval", type=int,
+                        default=_env("KV_FLUSH_INTERVAL", 30),
+                        help="Flush KV caches to disk every N queries.")
+    parser.add_argument("--save_kv", action="store_true",
+                        default=_env("SAVE_KV", False),
+                        help="Enable saving KV caches to disk (latent_mas mode).")
+
+    # ── Query-Aware AE args ────────────────────────────────────────────────
+    parser.add_argument("--ae_target_layers", type=str,
+                        default=_env("AE_TARGET_LAYERS", "-5,-4,-3,-2,-1"),
+                        help="Comma-separated (signed) layer indices for AE training, "
+                             "e.g. '-5,-4,-3,-2,-1'.")
+    parser.add_argument("--ae_bottleneck_dim", type=int,
+                        default=_env("AE_BOTTLENECK_DIM", 512),
+                        help="Bottleneck dimension Z for the Query-Aware AE.")
+    parser.add_argument("--ae_epochs", type=int,
+                        default=_env("AE_EPOCHS", 150),
+                        help="Training epochs per layer.")
+    parser.add_argument("--ae_batch_size", type=int,
+                        default=_env("AE_BATCH_SIZE", 256),
+                        help="Mini-batch size for AE training.")
+    parser.add_argument("--ae_lr", type=float,
+                        default=_env("AE_LR", 1e-3),
+                        help="Learning rate for AE optimizer.")
+    parser.add_argument("--ae_lambda_sparse", type=float,
+                        default=_env("AE_LAMBDA_SPARSE", 0.01),
+                        help="Weight for Jacobian sparsity loss.")
+    parser.add_argument("--ae_lambda_attn", type=float,
+                        default=_env("AE_LAMBDA_ATTN", 0.1),
+                        help="Weight for attention entropy loss.")
+    parser.add_argument("--ae_num_heads", type=int,
+                        default=_env("AE_NUM_HEADS", 0),
+                        help="Hidden dim of FeatureGate MLP (0 = auto = hidden_dim//2).")
+    parser.add_argument("--ae_checkpoint_dir", type=str,
+                        default=_env("AE_CHECKPOINT_DIR", ""),
+                        help="Root directory for AE checkpoints and data cache. "
+                             "Defaults to ae_checkpoints/paired_hidden_state_cache/.")
+    parser.add_argument("--ae_collect_samples", type=int,
+                        default=_env("AE_COLLECT_SAMPLES", -1),
+                        help="Number of samples to use for hidden state collection "
+                             "(-1 = same as --max_samples / all dataset).")
+    parser.add_argument("--ae_non_judger_agents", type=str,
+                        default=_env("AE_NON_JUDGER_AGENTS", "Planner,Critic,Refiner"),
+                        help="Comma-separated agent names whose hidden states are collected.")
 
     args = parser.parse_args()
     
@@ -177,10 +316,84 @@ def main():
             latent_steps=args.latent_steps,
             judger_max_new_tokens=args.max_new_tokens,
             **common_kwargs,
-            generate_bs=args.generate_bs, 
+            generate_bs=args.generate_bs,
             args=args,
             logger=logger,
         )
+        # Auto-load QAAE controllers if checkpoint dir & target layers exist
+        _ae_ckpt_dir = args.ae_checkpoint_dir or os.path.join(
+            os.path.dirname(__file__), "ae_checkpoints", "paired_hidden_state_cache"
+        )
+        if os.path.isdir(_ae_ckpt_dir) and args.ae_target_layers:
+            _ae_layers = [int(l.strip()) for l in args.ae_target_layers.split(",")]
+            _ae_device = args.device2 if args.use_second_HF_model else args.device
+            model.load_ae_controllers(
+                checkpoint_dir=_ae_ckpt_dir,
+                target_layers=_ae_layers,
+                device=_ae_device,
+            )
+    elif args.method == 'collect_and_train_ae':
+        method = LatentMASMethod(
+            model,
+            latent_steps=args.latent_steps,
+            judger_max_new_tokens=args.max_new_tokens,
+            **common_kwargs,
+            generate_bs=1,           # collect one sample at a time
+            args=args,
+            logger=logger,
+        )
+
+    # ── collect_and_train_ae: early-exit after AE pipeline ────────────────
+    if args.method == "collect_and_train_ae":
+        # Build dataset list upfront
+        if args.task == "gsm8k":
+            all_items = list(load_gsm8k(split=args.split))
+        elif args.task == "aime2024":
+            all_items = list(load_aime2024(split="train"))
+        elif args.task == "aime2025":
+            all_items = list(load_aime2025(split='train'))
+        elif args.task == "gpqa":
+            all_items = list(load_gpqa_diamond(split='test'))
+        elif args.task == "arc_easy":
+            all_items = list(load_arc_easy(split='test'))
+        elif args.task == "arc_challenge":
+            all_items = list(load_arc_challenge(split='test'))
+        elif args.task == "mbppplus":
+            all_items = list(load_mbppplus(split='test'))
+        elif args.task == "humanevalplus":
+            all_items = list(load_humanevalplus(split='test'))
+        elif args.task == "medqa":
+            all_items = list(load_medqa(split='test'))
+        else:
+            raise ValueError(f'no {args.task} support')
+
+        n_collect = args.ae_collect_samples if args.ae_collect_samples > 0 else len(all_items)
+        collect_items = all_items[:n_collect]
+        print(f"[AE] Collecting over {len(collect_items)} samples from {args.task}.")
+
+        # Parse AE config from args
+        target_layers = [int(x.strip()) for x in args.ae_target_layers.split(",")]
+        non_judger_agents = [x.strip() for x in args.ae_non_judger_agents.split(",")]
+        ae_cfg = AEConfig(
+            bottleneck_dim=args.ae_bottleneck_dim,
+            gate_hidden=args.ae_num_heads,   # reusing the arg slot, 0 = auto
+            epochs=args.ae_epochs,
+            batch_size=args.ae_batch_size,
+            lr=args.ae_lr,
+            lambda_sparse=args.ae_lambda_sparse,
+            lambda_attn=args.ae_lambda_attn,
+            target_layers=target_layers,
+            non_judger_agents=non_judger_agents,
+            device=str(device),
+        )
+
+        ckpt_dir = args.ae_checkpoint_dir if args.ae_checkpoint_dir else None
+        ae_trainer = AETrainer(method, args, ae_cfg=ae_cfg, checkpoint_dir=ckpt_dir)
+        ae_trainer.collect_and_train(collect_items)
+
+        logger.shutdown()
+        print("[AE] Done.")
+        return
 
     preds: List[Dict] = []
     processed = 0
