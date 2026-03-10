@@ -102,6 +102,7 @@ def _load_ae(checkpoint_dir: str, layer_idx: int, device: str = "cpu") -> QueryA
 
 @torch.no_grad()
 def analyse_layer(
+    data_dir: str,
     checkpoint_dir: str,
     layer_idx: int,
     n_samples: int = 2000,
@@ -112,9 +113,9 @@ def analyse_layer(
     print(f"  Layer {layer_idx}")
     print(f"{'='*60}")
 
-    # ── load data ──────────────────────────────────────────────────────
-    lat_path = os.path.join(checkpoint_dir, f"layer_{layer_idx}_latent.parquet")
-    inp_path = os.path.join(checkpoint_dir, f"layer_{layer_idx}_input.parquet")
+    # ── load data (parquet from data_dir) ──────────────────────────────
+    lat_path = os.path.join(data_dir, f"layer_{layer_idx}_latent.parquet")
+    inp_path = os.path.join(data_dir, f"layer_{layer_idx}_input.parquet")
 
     H_latent = _load_parquet(lat_path, n_samples).to(device)  # [N, D]
     H_input  = _load_parquet(inp_path, n_samples).to(device)  # [M, D]
@@ -125,7 +126,7 @@ def analyse_layer(
 
     print(f"  Loaded: {N:,} latent samples, D={H_latent.shape[1]}")
 
-    # ── load model ──────────────────────────────────────────────────────
+    # ── load model (AE from checkpoint_dir) ────────────────────────────
     model = _load_ae(checkpoint_dir, layer_idx, device)
 
     # ── normalize (same as training) ───────────────────────────────────
@@ -167,8 +168,8 @@ def analyse_layer(
     print(f"  Gate > 0.5 frac:  {gate_sparse:.4f}")
     print(f"  |z| mean:          {z_l1:.4f}")
 
-    # ── load training CSV ───────────────────────────────────────────────
-    csv_path = os.path.join(checkpoint_dir, f"layer_{layer_idx}_training.csv")
+    # ── load training CSV (from data_dir, where logger writes it) ─────
+    csv_path = os.path.join(data_dir, f"layer_{layer_idx}_training.csv")
     loss_df  = pd.read_csv(csv_path) if os.path.exists(csv_path) else None
 
     # ─────────────────────────────────────────────────────────────────
@@ -371,22 +372,26 @@ def plot_cross_layer_summary(summaries: list, out_dir: str) -> None:
 
 def main():
     parser = argparse.ArgumentParser(description="Analyse trained QAAE checkpoints")
+    parser.add_argument("--data_dir", default="latent_data/gsm8k",
+                        help="Directory with parquet data files (hidden states).")
     parser.add_argument("--checkpoint_dir", default="ae_checkpoints/paired_hidden_state_cache",
-                        help="Directory with AE checkpoints and parquet files")
+                        help="Directory with AE model checkpoints (.pt files).")
     parser.add_argument("--layers", default="-5,-4,-3,-2,-1",
                         help="Comma-separated layer indices to analyse (default: all 5)")
-    parser.add_argument("--n_samples", type=int, default=3000,
-                        help="Max samples to load per layer (default: 3000)")
+    parser.add_argument("--n_samples", type=int, default=45000,
+                        help="Max samples to load per layer (default: 45000)")
     parser.add_argument("--device", default="cpu",
                         help="torch device (cpu / cuda)")
     parser.add_argument("--out_dir", default="ae_analysis",
                         help="Output directory for PNG files")
     args = parser.parse_args()
 
+    data_dir       = os.path.join(ROOT, args.data_dir)
     checkpoint_dir = os.path.join(ROOT, args.checkpoint_dir)
     out_dir        = os.path.join(ROOT, args.out_dir)
     layers         = [int(l.strip()) for l in args.layers.split(",")]
 
+    print(f"Data dir       : {data_dir}")
     print(f"Checkpoint dir : {checkpoint_dir}")
     print(f"Output dir     : {out_dir}")
     print(f"Layers         : {layers}")
@@ -397,6 +402,7 @@ def main():
     for layer_idx in layers:
         try:
             s = analyse_layer(
+                data_dir       = data_dir,
                 checkpoint_dir = checkpoint_dir,
                 layer_idx      = layer_idx,
                 n_samples      = args.n_samples,

@@ -693,186 +693,138 @@ class ModelWrapper:
 
         return past, hidden_states_record
 
-
-
+    # ──────────────────────────────────────────────────────────────────────
+    # Two-phase: Think first, then AE-distill for inter-agent transfer
+    # ──────────────────────────────────────────────────────────────────────
 
     @torch.no_grad()
-    def generate_latent_batch_ae_enhanced(
+    def generate_latent_then_transfer(
         self,
-        input_ids,
-        attention_mask=None,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
         *,
-        latent_steps,
-        past_key_values=None,
-        ae_target_layers=None,
-    ):
-        """Generate latent steps using QAAE-enhanced hidden state fusion.
+        latent_steps: int,
+        past_key_values: Optional[Tuple] = None,
+        ae_target_layers: Optional[List[int]] = None,
+    ) -> Tuple[Optional[Tuple], torch.Tensor, dict]:
+        """Two-phase latent generation: Think → AE Reconstruct → Transfer.
 
-        Strategy (depends on number of loaded AE layers):
+        Phase 1 — Thinking:
+            Run latent steps with standard realignment (preserving basic LLM
+            flow). Collect hidden states at all layers.
+            **The thinking KV cache is DISCARDED** after this phase.
 
-        Single AE layer (e.g. AE_TARGET_LAYERS=-1):
-            Each latent step = 1 token: QAAE(-1)(last_hidden, h_input) → align → embed
+        Phase 2 — Transfer:
+            For EVERY latent step and EVERY AE target layer, use trained AE
+            to reconstruct + gate-filter hidden states. Align reconstructed
+            states to embedding space and feed through the model to build
+            fresh KV cache entries for inter-agent communication.
+            Produces **latent_steps × N_ae_layers** transfer tokens.
 
-        Multiple AE layers (e.g. AE_TARGET_LAYERS=-3,-2,-1):
-            Each latent step = N tokens, one per layer, fed SEQUENTIALLY into KV cache:
-              For l in [-3, -2, -1]:
-                h_rec_l = QAAE_l(last_hidden_l, h_input_l) → align → embed_l
-                model(inputs_embeds=embed_l, past_kv=past) → KV cache grows by 1 token
-                last_hidden ← output hidden state of this sub-step
-            So total KV tokens = latent_steps × N (multi-perspective latent thoughts)
+        Args:
+            input_ids:        [B, T] prompt token IDs.
+            attention_mask:   [B, T] attention mask.
+            latent_steps:     number of thinking steps.
+            past_key_values:  KV cache from previous agents.
+            ae_target_layers: signed layer indices for AE (e.g. [-5,-4,-3,-2,-1]).
 
-        Falls back to standard _apply_latent_realignment if no AE loaded.
+        Returns:
+            (transfer_past_kv, transfer_embeds, hidden_states_record)
+            - transfer_past_kv:      prev_agents_KV + transfer token KV
+            - transfer_embeds:       [B, steps×N_layers, D] aligned embeddings
+            - hidden_states_record:  collected hidden states (for analysis / logging)
         """
-        import torch
-        model  = self.HF_model if hasattr(self, "HF_model") else self.model
+        model = self.HF_model if hasattr(self, "HF_model") else self.model
         device = self.HF_device if hasattr(self, "HF_device") else str(self.device)
 
-        if attention_mask is None:
-            attention_mask = torch.ones_like(input_ids, device=device)
-        else:
-            attention_mask = attention_mask.to(device)
-
-        if past_key_values is not None:
-            past_len = _past_length(past_key_values)
-            if past_len > 0:
-                past_mask = torch.ones(
-                    (attention_mask.shape[0], past_len),
-                    dtype=attention_mask.dtype,
-                    device=attention_mask.device,
-                )
-                attention_mask = torch.cat([past_mask, attention_mask], dim=-1)
-
-        # ── Initial forward pass on input tokens ──────────────────────────────
-        outputs = model(
-            input_ids=input_ids,
+        # ── Phase 1: Thinking ─────────────────────────────────────────────
+        _thinking_past, hs_record = self.generate_latent_batch_all_layers_hidden_states(
+            input_ids,
             attention_mask=attention_mask,
+            latent_steps=latent_steps,
             past_key_values=past_key_values,
-            use_cache=True,
-            output_hidden_states=True,
-            return_dict=True,
         )
-        past = outputs.past_key_values
-        num_layers = len(outputs.hidden_states) - 1  # exclude embedding layer
+        del _thinking_past  # discard — only hidden states are kept
+        torch.cuda.empty_cache()
 
-        # Hidden states of LAST INPUT TOKEN at every layer: [B, L+1, D]
-        last_input_token_all_layers = torch.stack(
-            [hs[:, -1, :].detach().clone() for hs in outputs.hidden_states],
-            dim=1,
-        )
-        last_hidden = outputs.hidden_states[-1][:, -1, :]  # [B, D]
+        # ── Phase 2: AE Reconstruct → Align → Transfer KV ────────────────
+        num_layers = hs_record["last_input_token"].shape[1] - 1  # excl. embedding layer
 
-        # Resolve signed → abs layer indices (sorted from earliest to latest)
         ae_signed = sorted(
             ae_target_layers or list(self._ae_controllers.keys()),
             key=lambda x: x if x >= 0 else num_layers + x,
         )
-        ae_abs = [(num_layers + li if li < 0 else li) for li in ae_signed]
 
         source_model = self.HF_model if hasattr(self, "HF_model") else self.model
+        aligned_list: List[torch.Tensor] = []
 
-        latent_step_all_layers = []
+        # Iterate over ALL latent steps × ALL AE target layers
+        # Order: step_0/layer_a, step_0/layer_b, ..., step_1/layer_a, ...
+        steps_to_process = hs_record["latent_steps"] if hs_record["latent_steps"] else []
 
-        # ── steps Latent ─────────────────
-        for step in range(latent_steps):
+        for step_idx, step_hs in enumerate(steps_to_process):
+            # step_hs: [B, num_layers+1, D] — hidden states at all layers for this step
+            for signed_li in ae_signed:
+                abs_li = num_layers + signed_li if signed_li < 0 else signed_li
+                ae = self._ae_controllers.get(signed_li)
 
-            if not self._ae_controllers or not ae_signed:
-                # ── Fallback: standard single-token realignment ────────────────
-                latent_vec = self._apply_latent_realignment(last_hidden, source_model)
-                latent_embed = latent_vec.unsqueeze(1)  # [B, 1, D]
+                # h_input:  last input token HS at this layer (fixed reference)  [B, D]
+                h_input = hs_record["last_input_token"][:, abs_li, :].to(device).float()
 
-                past_len = _past_length(past)
-                latent_mask = torch.ones(
-                    (latent_embed.shape[0], past_len + 1),
-                    dtype=torch.long, device=latent_embed.device,
-                )
-                outputs = model(
-                    inputs_embeds=latent_embed,
-                    attention_mask=latent_mask,
-                    past_key_values=past,
-                    use_cache=True,
-                    output_hidden_states=True,
-                    return_dict=True,
-                )
-                past = outputs.past_key_values
-                last_hidden = outputs.hidden_states[-1][:, -1, :]
+                # h_latent: this step's HS at this layer  [B, D]
+                h_latent = step_hs[:, abs_li, :].to(device).float()
 
-                step_all_layers = torch.stack(
-                    [hs[:, -1, :].detach().clone() for hs in outputs.hidden_states], dim=1,
-                )
-                latent_step_all_layers.append(step_all_layers)
-
-            else:
-                # ── AE-enhanced: feed each layer as a SEPARATE token ──────────
-                # Iterate layers in order (earliest → latest layer)
-                step_last_hs = None  # record hs from last sub-step of this step
-
-                for signed_li, abs_li in zip(ae_signed, ae_abs):
-                    ae = self._ae_controllers.get(signed_li)
-
-                    if ae is None:
-                        # No AE for this layer → standard realignment token
-                        latent_vec = self._apply_latent_realignment(last_hidden, source_model)
-                    else:
-                        # h_latent: the hidden state at this layer
-                        #   step 0  → use input hs (no latent step yet)
-                        #   step >0 → use previous step's hs at this layer
-                        if step == 0 or step_last_hs is None:
-                            h_latent_l = last_input_token_all_layers[:, abs_li, :]
-                        else:
-                            h_latent_l = step_last_hs[:, abs_li, :]
-
-                        # h_input: query = last input token hs at this layer (fixed)
-                        h_input_l = last_input_token_all_layers[:, abs_li, :]
-
-                        h_latent_l = h_latent_l.to(device).float()
-                        h_input_l  = h_input_l.to(device).float()
-
-                        ae_device = next(ae.parameters()).device
-                        h_rec, _z, gate = ae(
-                            h_latent_l.to(ae_device),
-                            h_input_l.to(ae_device),
-                            normalize=True,
-                        )
-                        h_rec = h_rec.to(device)
-                        gate  = gate.to(device)
-
-                        # Masked Reconstruction: zero out garbage values
-                        # from unimportant features (gate ≈ 0), keeping only
-                        # well-reconstructed important features (gate ≈ 1).
-                        h_rec = gate * h_rec
-
-                        # Align to embedding distribution
-                        latent_vec = self._apply_latent_realignment(
-                            h_rec.to(last_hidden.dtype), source_model
-                        )
-
-                    # Feed this layer's token into KV cache
-                    latent_embed = latent_vec.unsqueeze(1)   # [B, 1, D]
-                    past_len = _past_length(past)
-                    latent_mask = torch.ones(
-                        (latent_embed.shape[0], past_len + 1),
-                        dtype=torch.long, device=latent_embed.device,
+                if ae is not None:
+                    ae_dev = next(ae.parameters()).device
+                    h_rec, _z, gate = ae(
+                        h_latent.to(ae_dev),
+                        h_input.to(ae_dev),
+                        normalize=True,
                     )
-                    outputs = model(
-                        inputs_embeds=latent_embed,
-                        attention_mask=latent_mask,
-                        past_key_values=past,
-                        use_cache=True,
-                        output_hidden_states=True,
-                        return_dict=True,
+                    h_rec = h_rec.to(device)
+                    gate = gate.to(device)
+                    # Denormalize h_rec back to original scale before gating
+                    if ae._has_norm:
+                        std_lat = ae._norm_std_latent.to(device)
+                        mean_lat = ae._norm_mean_latent.to(device)
+                        h_rec = h_rec * std_lat + mean_lat
+                    h_rec = gate * h_rec  # gate masking in original scale
+                    aligned = self._apply_latent_realignment(
+                        h_rec.to(h_input.dtype), source_model,
                     )
-                    past = outputs.past_key_values
-                    last_hidden = outputs.hidden_states[-1][:, -1, :]  # update for next sub-step
+                else:
+                    # No AE for this layer → standard realignment only
+                    aligned = self._apply_latent_realignment(
+                        h_latent.to(h_input.dtype), source_model,
+                    )
+                aligned_list.append(aligned)
 
-                # Record all-layer hs from the LAST sub-step of this latent step
-                step_last_hs = torch.stack(
-                    [hs[:, -1, :].detach().clone() for hs in outputs.hidden_states], dim=1,
-                )
-                latent_step_all_layers.append(step_last_hs)
+        if not aligned_list:
+            # Fallback: no latent steps or no AE layers → single token
+            last_h = hs_record["last_input_token"][:, -1, :].to(device)
+            aligned = self._apply_latent_realignment(last_h, source_model)
+            aligned_list.append(aligned)
 
-        hidden_states_record = {
-            "last_input_token": last_input_token_all_layers,
-            "latent_steps":     latent_step_all_layers,
-        }
-        return past, hidden_states_record
+        # [B, latent_steps × N_ae_layers, D]
+        transfer_embeds = torch.stack(aligned_list, dim=1)
 
+        # Cast to model dtype (e.g. bfloat16) — AE processing uses float32
+        model_dtype = next(model.parameters()).dtype
+        transfer_embeds = transfer_embeds.to(dtype=model_dtype, device=device)
+
+        # ── Build transfer KV cache ──────────────────────────────────────
+        past_len = _past_length(past_key_values) if past_key_values is not None else 0
+        xfer_mask = torch.ones(
+            (transfer_embeds.shape[0], past_len + transfer_embeds.shape[1]),
+            dtype=torch.long, device=device,
+        )
+        outputs = model(
+            inputs_embeds=transfer_embeds,
+            attention_mask=xfer_mask,
+            past_key_values=past_key_values,  # base = previous agents' KV
+            use_cache=True,
+            output_hidden_states=False,
+            return_dict=True,
+        )
+
+        return outputs.past_key_values, transfer_embeds, hs_record

@@ -220,16 +220,28 @@ class LatentMASMethod:
                     wrapped_tokens_batch.append(self.model.tokenizer.convert_ids_to_tokens(active_ids))
 
                 # -------------------------------------------------------
-                # Use AE-enhanced generation if AE controllers are loaded,
-                # otherwise fall back to the standard all-layers method.
+                # Two-phase flow: Think purely → AE filter for transfer
+                # If no AE loaded, fall back to standard all-layers method.
                 # -------------------------------------------------------
                 if self.model._ae_controllers:
-                    past_kv, hs_record = self.model.generate_latent_batch_ae_enhanced(
+                    # Phase 1: Think (standard latent steps, no AE)
+                    # Phase 2: AE reconstruct + filter → transfer KV
+                    ae_layers = getattr(self.args, "ae_target_layers_parsed", None)
+                    past_kv, _, hs_record = self.model.generate_latent_then_transfer(
                         wrapped_ids,
                         attention_mask=wrapped_mask,
                         latent_steps=self.latent_steps,
                         past_key_values=past_kv,
+                        ae_target_layers=ae_layers,
                     )
+                    # Transfer KV = prev_agents_KV + N_ae_layers transfer tokens
+                    # For sequential/latent modes: keep only this agent's transfer tokens
+                    if self.sequential_info_only or self.latent_only:
+                        n_transfer = len(
+                            ae_layers or list(self.model._ae_controllers.keys())
+                        )
+                        past_kv = self._truncate_past(past_kv, n_transfer)
+                    # accumulate_latent: no truncation — transfer tokens accumulate naturally
                 else:
                     past_kv, hs_record = self.model.generate_latent_batch_all_layers_hidden_states(
                         wrapped_ids,
@@ -237,26 +249,23 @@ class LatentMASMethod:
                         latent_steps=self.latent_steps,
                         past_key_values=past_kv,
                     )
+                    if self.accumulate_latent:
+                        input_len = wrapped_ids.shape[1]
+                        past_kv = self._strip_input_from_past(
+                            past_kv, prev_past_len, prev_past_len + input_len
+                        )
+                    elif self.sequential_info_only or self.latent_only:
+                        new_past_len = _past_length(past_kv)
+                        tokens_added = new_past_len - prev_past_len
+                        tokens_to_keep = self.latent_steps if self.latent_only else tokens_added
+                        past_kv = self._truncate_past(past_kv, tokens_to_keep)
 
                 # Store hidden states for this agent
                 self.hidden_states_record.append({
                     "agent_name": agent.name,
-                    # [B, num_layers+1, D] — hidden states of last input token at every layer
                     "last_input_token": hs_record["last_input_token"],
-                    # list of latent_steps tensors, each [B, num_layers+1, D]
                     "latent_steps": hs_record["latent_steps"],
                 })
-
-                if self.accumulate_latent:
-                    input_len = wrapped_ids.shape[1]
-                    past_kv = self._strip_input_from_past(
-                        past_kv, prev_past_len, prev_past_len + input_len
-                    )
-                elif self.sequential_info_only or self.latent_only:
-                    new_past_len = _past_length(past_kv)
-                    tokens_added = new_past_len - prev_past_len
-                    tokens_to_keep = self.latent_steps if self.latent_only else tokens_added
-                    past_kv = self._truncate_past(past_kv, tokens_to_keep)
 
                 for idx in range(batch_size):
                     mask = wrapped_mask[idx].bool()
@@ -486,16 +495,27 @@ class LatentMASMethod:
                     wrapped_tokens_batch.append(self.model.tokenizer.convert_ids_to_tokens(active_ids))
 
                 # -------------------------------------------------------
-                # Use AE-enhanced generation if AE controllers are loaded,
-                # otherwise fall back to the standard all-layers method.
+                # Two-phase flow: Think purely → AE filter for transfer
+                # If no AE loaded, fall back to standard all-layers method.
                 # -------------------------------------------------------
                 if self.model._ae_controllers:
-                    past_kv, hs_record = self.model.generate_latent_batch_ae_enhanced(
+                    # Phase 1: Think (standard latent steps, no AE)
+                    # Phase 2: AE reconstruct + filter → transfer embeddings
+                    ae_layers = getattr(self.args, "ae_target_layers_parsed", None)
+                    past_kv, transfer_embeds, hs_record = self.model.generate_latent_then_transfer(
                         wrapped_ids,
                         attention_mask=wrapped_mask,
                         latent_steps=self.latent_steps,
                         past_key_values=past_kv,
+                        ae_target_layers=ae_layers,
                     )
+                    # transfer_embeds: [B, N_ae_layers, D] — already AE-filtered & aligned
+                    previous_hidden_embedding = transfer_embeds.detach()
+
+                    if self.sequential_info_only or self.latent_only:
+                        n_transfer = transfer_embeds.shape[1]
+                        past_kv = self._truncate_past(past_kv, n_transfer)
+                    # accumulate_latent: no truncation needed
                 else:
                     past_kv, hs_record = self.model.generate_latent_batch_all_layers_hidden_states(
                         wrapped_ids,
@@ -503,53 +523,41 @@ class LatentMASMethod:
                         latent_steps=self.latent_steps,
                         past_key_values=past_kv,
                     )
-
-                # Store hidden states for this agent
-                self.hidden_states_record.append({
-                    "agent_name": agent.name,
-                    # [B, num_layers+1, D] — hidden states of last input token at every layer
-                    "last_input_token": hs_record["last_input_token"],
-                    # list of latent_steps tensors, each [B, num_layers+1, D]
-                    "latent_steps": hs_record["latent_steps"],
-                })
-
-                # Also build the last-layer embedding record for vLLM judger input
-                # (replicating the logic from LatentMASMethod.run_batch_vllm)
-                previous_hidden_embedding = torch.cat(
-                    [hs_record["last_input_token"][:, 0:1, :]]  # embedding layer as placeholder
-                    + [s[:, -1:, :] for s in hs_record["latent_steps"]],  # last-layer latent
-                    dim=1,
-                )
-                # More precisely: replicate what generate_latent_batch_hidden_state returned
-                # (input embedding + latent step last-layer outputs)
-                # We rebuild it from hs_record to avoid a second forward pass.
-                last_input_emb = hs_record["last_input_token"][:, 0:1, :]  # [B,1,D] embedding
-                latent_last_layers = torch.cat(
-                    [s[:, -1:, :] for s in hs_record["latent_steps"]], dim=1
-                ) if hs_record["latent_steps"] else last_input_emb[:, 0:0, :]  # [B, latent_steps, D]
-                previous_hidden_embedding = torch.cat(
-                    [last_input_emb, latent_last_layers], dim=1
-                )  # [B, 1+latent_steps, D]
-
-                if self.accumulate_latent:
-                    input_len = wrapped_ids.shape[1]
-                    past_kv = self._strip_input_from_past(
-                        past_kv, prev_past_len, prev_past_len + input_len
+                    # Build embedding record from hs_record for vLLM judger
+                    last_input_emb = hs_record["last_input_token"][:, 0:1, :]
+                    latent_last_layers = torch.cat(
+                        [s[:, -1:, :] for s in hs_record["latent_steps"]], dim=1
+                    ) if hs_record["latent_steps"] else last_input_emb[:, 0:0, :]
+                    previous_hidden_embedding = torch.cat(
+                        [last_input_emb, latent_last_layers], dim=1
                     )
-                    if self.latent_steps > 0:
-                        previous_hidden_embedding = previous_hidden_embedding[:, -self.latent_steps:, :]
-                    else:
-                        previous_hidden_embedding = previous_hidden_embedding[:, 0:0, :]
-                elif self.sequential_info_only or self.latent_only:
-                    new_past_len = _past_length(past_kv)
-                    tokens_added = new_past_len - prev_past_len
-                    tokens_to_keep = self.latent_steps if self.latent_only else tokens_added
-                    past_kv = self._truncate_past(past_kv, tokens_to_keep)
-                    if self.latent_only:
+
+                    if self.accumulate_latent:
+                        input_len = wrapped_ids.shape[1]
+                        past_kv = self._strip_input_from_past(
+                            past_kv, prev_past_len, prev_past_len + input_len
+                        )
                         if self.latent_steps > 0:
                             previous_hidden_embedding = previous_hidden_embedding[:, -self.latent_steps:, :]
                         else:
                             previous_hidden_embedding = previous_hidden_embedding[:, 0:0, :]
+                    elif self.sequential_info_only or self.latent_only:
+                        new_past_len = _past_length(past_kv)
+                        tokens_added = new_past_len - prev_past_len
+                        tokens_to_keep = self.latent_steps if self.latent_only else tokens_added
+                        past_kv = self._truncate_past(past_kv, tokens_to_keep)
+                        if self.latent_only:
+                            if self.latent_steps > 0:
+                                previous_hidden_embedding = previous_hidden_embedding[:, -self.latent_steps:, :]
+                            else:
+                                previous_hidden_embedding = previous_hidden_embedding[:, 0:0, :]
+
+                # Store hidden states for this agent
+                self.hidden_states_record.append({
+                    "agent_name": agent.name,
+                    "last_input_token": hs_record["last_input_token"],
+                    "latent_steps": hs_record["latent_steps"],
+                })
 
                 embedding_record.append(previous_hidden_embedding)
 

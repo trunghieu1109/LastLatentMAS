@@ -69,6 +69,41 @@ from experiment_logger import ExperimentLogger
 import time
 
 
+def _parse_target_layers(spec: str, model) -> list:
+    """Parse ``--ae_target_layers`` into a list of integer layer indices.
+
+    Supported formats:
+        * ``"all"``            → every layer index ``[0 .. num_hidden_layers]``
+        * ``"5-20"``           → range(5, 21)  (inclusive end)
+        * ``"-10--1"``         → [-10, -9, ..., -1]  (negative range)
+        * ``"-5,-4,-3,-2,-1"`` → explicit comma-separated signed ints
+    """
+    import re
+    spec = spec.strip()
+
+    # --- "all" ----------------------------------------------------------------
+    if spec.lower() == "all":
+        hf = getattr(model, "HF_model", None) or getattr(model, "model", None)
+        n = hf.config.num_hidden_layers + 1  # +1 for embedding layer
+        layers = list(range(n))
+        print(f"[ae_target_layers] 'all' → {n} layers (0 … {n - 1})")
+        return layers
+
+    # --- range  e.g. "5-20" or "-10--1" ----------------------------------------
+    # Use regex to match two signed integers separated by a dash.
+    # Pattern: optional minus + digits, dash, optional minus + digits
+    # e.g.  "5-20"  →  (5, 20)     "-10--1"  →  (-10, -1)
+    m = re.match(r'^\s*(-?\d+)\s*-\s*(-?\d+)\s*$', spec)
+    if m:
+        lo, hi = int(m.group(1)), int(m.group(2))
+        layers = list(range(lo, hi + 1))
+        print(f"[ae_target_layers] range {lo}..{hi} → {len(layers)} layers")
+        return layers
+
+    # --- comma-separated ints -------------------------------------------------
+    return [int(x.strip()) for x in spec.split(",")]
+
+
 def evaluate(preds: List[Dict]) -> Tuple[float, int]:
     total = len(preds)
     correct = sum(1 for p in preds if p.get("correct", False))
@@ -153,11 +188,13 @@ def main():
     # core args for experiments
     parser.add_argument("--method",
                         choices=["baseline", "text_mas", "latent_mas", "com_mas",
-                                 "collect_and_train_ae"],
+                                 "collect_and_train_ae", "collect_only"],
                         default=_env("METHOD", None),
                         required=(os.environ.get("METHOD") is None),
                         help="Which multi-agent method to run. Use 'collect_and_train_ae' "
-                             "to collect hidden state data and train the Query-Aware AE.")
+                             "to collect hidden state data and train the Query-Aware AE. "
+                             "Use 'collect_only' to only collect hidden states and export "
+                             "to a benchmark/ directory (no AE training).")
     parser.add_argument("--model_name", type=str,
                         choices=["Qwen/Qwen3-0.6B", "Qwen/Qwen3-4B", "Qwen/Qwen3-14B"],
                         default=_env("MODEL_NAME", None),
@@ -230,8 +267,9 @@ def main():
     # ── Query-Aware AE args ────────────────────────────────────────────────
     parser.add_argument("--ae_target_layers", type=str,
                         default=_env("AE_TARGET_LAYERS", "-5,-4,-3,-2,-1"),
-                        help="Comma-separated (signed) layer indices for AE training, "
-                             "e.g. '-5,-4,-3,-2,-1'.")
+                        help="Layer indices for hidden-state collection / AE training. "
+                             "Accepts: 'all' (every layer), a range like '0-27' or "
+                             "'-10--1', or comma-separated signed ints e.g. '-5,-4,-3,-2,-1'.")
     parser.add_argument("--ae_bottleneck_dim", type=int,
                         default=_env("AE_BOTTLENECK_DIM", 512),
                         help="Bottleneck dimension Z for the Query-Aware AE.")
@@ -261,6 +299,9 @@ def main():
                         default=_env("AE_COLLECT_SAMPLES", -1),
                         help="Number of samples to use for hidden state collection "
                              "(-1 = same as --max_samples / all dataset).")
+    parser.add_argument("--ae_latent_data_dir", type=str,
+                        default=_env("AE_LATENT_DATA_DIR", "latent_data"),
+                        help="Directory to save the collected hidden states when using 'collect_only'.")
     parser.add_argument("--ae_non_judger_agents", type=str,
                         default=_env("AE_NON_JUDGER_AGENTS", "Planner,Critic,Refiner"),
                         help="Comma-separated agent names whose hidden states are collected.")
@@ -325,14 +366,16 @@ def main():
             os.path.dirname(__file__), "ae_checkpoints", "paired_hidden_state_cache"
         )
         if os.path.isdir(_ae_ckpt_dir) and args.ae_target_layers:
-            _ae_layers = [int(l.strip()) for l in args.ae_target_layers.split(",")]
+            _ae_layers = _parse_target_layers(args.ae_target_layers, model)
+            # Store parsed layers on args for LatentMASMethod to access
+            args.ae_target_layers_parsed = _ae_layers
             _ae_device = args.device2 if args.use_second_HF_model else args.device
             model.load_ae_controllers(
                 checkpoint_dir=_ae_ckpt_dir,
                 target_layers=_ae_layers,
                 device=_ae_device,
             )
-    elif args.method == 'collect_and_train_ae':
+    elif args.method in ('collect_and_train_ae', 'collect_only'):
         method = LatentMASMethod(
             model,
             latent_steps=args.latent_steps,
@@ -343,8 +386,8 @@ def main():
             logger=logger,
         )
 
-    # ── collect_and_train_ae: early-exit after AE pipeline ────────────────
-    if args.method == "collect_and_train_ae":
+    # ── collect_and_train_ae / collect_only: early-exit after AE pipeline ──
+    if args.method in ("collect_and_train_ae", "collect_only"):
         # Build dataset list upfront
         if args.task == "gsm8k":
             all_items = list(load_gsm8k(split=args.split))
@@ -372,7 +415,7 @@ def main():
         print(f"[AE] Collecting over {len(collect_items)} samples from {args.task}.")
 
         # Parse AE config from args
-        target_layers = [int(x.strip()) for x in args.ae_target_layers.split(",")]
+        target_layers = _parse_target_layers(args.ae_target_layers, model)
         non_judger_agents = [x.strip() for x in args.ae_non_judger_agents.split(",")]
         ae_cfg = AEConfig(
             bottleneck_dim=args.ae_bottleneck_dim,
@@ -389,10 +432,15 @@ def main():
 
         ckpt_dir = args.ae_checkpoint_dir if args.ae_checkpoint_dir else None
         ae_trainer = AETrainer(method, args, ae_cfg=ae_cfg, checkpoint_dir=ckpt_dir)
-        ae_trainer.collect_and_train(collect_items)
 
-        logger.shutdown()
-        print("[AE] Done.")
+        if args.method == "collect_only":
+            ae_trainer.collect_only(collect_items)
+            logger.shutdown()
+            print(f"[Collect-Only] Done. Data → {ae_trainer.data_dir}")
+        else:
+            ae_trainer.collect_and_train(collect_items)
+            logger.shutdown()
+            print(f"[AE] Done. Data → {ae_trainer.data_dir}  |  Models → {ae_trainer.checkpoint_dir}")
         return
 
     preds: List[Dict] = []

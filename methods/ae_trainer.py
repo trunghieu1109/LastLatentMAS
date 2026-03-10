@@ -1,12 +1,17 @@
 """Query-Aware AE Trainer: data collection + training + checkpoint management.
 
-Checkpoint layout (mirrors ae_checkpoints/paired_hidden_state_cache/):
-    <checkpoint_dir>/
+Directory layout:
+    <data_dir>/                         (default: <ae_latent_data_dir>/<task>/)
         cache_metadata.json
+        collect_log.txt
         layer_{idx}_input.parquet       # [N, D] — last input token hidden states
         layer_{idx}_latent.parquet      # [N*latent_steps, D] — latent step hidden states
+
+    <checkpoint_dir>/                   (default: ae_checkpoints/paired_hidden_state_cache/)
         ae_layer_{idx}.pt               # trained QueryAwareAutoencoder state_dict + config
         training_log_layer_{idx}.json   # per-epoch loss history
+        layer_{idx}_summary.json        # training summary
+        layer_{idx}_training.csv        # per-epoch CSV log
 
 Usage from run.py:
     ae_trainer = AETrainer(method, args)
@@ -301,24 +306,70 @@ def _log_path(checkpoint_dir: str, layer_idx: int) -> str:
     return os.path.join(checkpoint_dir, f"training_log_layer_{layer_idx}.json")
 
 
-def _meta_path(checkpoint_dir: str) -> str:
-    return os.path.join(checkpoint_dir, "cache_metadata.json")
+def _meta_path(data_dir: str) -> str:
+    return os.path.join(data_dir, "cache_metadata.json")
 
 
 def _save_tensor_parquet(tensor: torch.Tensor, path: str) -> None:
-    """Save [N, D] float tensor as parquet (appending if file exists)."""
+    """Save [N, D] float tensor as parquet (appending if file exists).
+
+    Uses pyarrow directly to avoid pandas column-duplication bugs
+    when concatenating DataFrames with identical column names.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
     arr = tensor.float().cpu().numpy()
-    df = pd.DataFrame(arr)
+    col_names = [str(i) for i in range(arr.shape[1])]
+    table_new = pa.table({c: arr[:, i] for i, c in enumerate(col_names)})
+
     if os.path.exists(path):
-        existing = pd.read_parquet(path)
-        df = pd.concat([existing, df], ignore_index=True)
-    df.to_parquet(path, index=False)
+        table_old = pq.read_table(path, columns=col_names)
+        table_combined = pa.concat_tables([table_old, table_new])
+    else:
+        table_combined = table_new
+
+    pq.write_table(table_combined, path)
 
 
 def _load_tensor_parquet(path: str, device: str = "cpu") -> torch.Tensor:
-    """Load parquet → [N, D] float tensor."""
-    df = pd.read_parquet(path)
-    return torch.tensor(df.values, dtype=torch.float32, device=device)
+    """Load parquet → [N, D] float tensor.
+
+    Handles files that may have duplicate columns (from earlier buggy saves)
+    by reading only the first unique set of columns by index.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    import numpy as np
+
+    pf = pq.ParquetFile(path)
+    col_names = pf.schema_arrow.names
+    unique_names = set(col_names)
+
+    if len(unique_names) < len(col_names):
+        # Duplicate columns: read raw, take first unique set
+        table = pf.read()
+        n_unique = len(unique_names)
+        arr = np.column_stack([
+            table.column(i).to_numpy(zero_copy_only=False)
+            for i in range(n_unique)
+        ]).astype('float32')
+    else:
+        table = pf.read()
+        # Drop non-numeric columns
+        numeric_indices = [
+            i for i, f in enumerate(table.schema)
+            if pa.types.is_floating(f.type) or pa.types.is_integer(f.type)
+        ]
+        if len(numeric_indices) < table.num_columns:
+            arr = np.column_stack([
+                table.column(i).to_numpy(zero_copy_only=False)
+                for i in numeric_indices
+            ]).astype('float32')
+        else:
+            arr = table.to_pandas().values.astype('float32')
+
+    return torch.tensor(arr, dtype=torch.float32, device=device)
 
 
 def _has_ae_checkpoint(checkpoint_dir: str, layer_idx: int) -> bool:
@@ -339,13 +390,22 @@ def _has_cache(cache_dir: str, layer_idx: int) -> bool:
 class AETrainer:
     """Orchestrates data collection and per-layer AE training.
 
+    Directory layout:
+        - ``data_dir``       → parquet hidden-state caches + collection metadata
+                                (default: ``<ae_latent_data_dir>/<task>/``)
+        - ``checkpoint_dir`` → trained AE model checkpoints (``.pt``) + training logs
+                                (default: ``ae_checkpoints/paired_hidden_state_cache/``)
+
     Args:
         method: a LatentMASMethod / ComLatMAS instance whose ``hidden_states_record``
                 is populated after each ``run_batch`` call.
-        args:   argparse.Namespace with at least {model_name, latent_steps, device}.
+        args:   argparse.Namespace with at least {model_name, latent_steps, device,
+                task, ae_latent_data_dir}.
         ae_cfg: AEConfig (uses defaults if None).
-        checkpoint_dir: root directory for checkpoints and cache.
+        checkpoint_dir: root directory for AE model checkpoints.
                         Defaults to ``ae_checkpoints/paired_hidden_state_cache``.
+        data_dir: root directory for parquet data files.
+                  Defaults to ``<ae_latent_data_dir>/<task>/``.
     """
 
     def __init__(
@@ -354,6 +414,7 @@ class AETrainer:
         args,
         ae_cfg: Optional[AEConfig] = None,
         checkpoint_dir: Optional[str] = None,
+        data_dir: Optional[str] = None,
     ):
         self.method = method
         self.args = args
@@ -361,12 +422,22 @@ class AETrainer:
         self.device = self.cfg.device
 
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+        # ── checkpoint_dir: AE model .pt files ──────────────────────────────
         if checkpoint_dir is None:
             checkpoint_dir = os.path.join(
                 project_root, "ae_checkpoints", "paired_hidden_state_cache"
             )
         self.checkpoint_dir = checkpoint_dir
         os.makedirs(self.checkpoint_dir, exist_ok=True)
+
+        # ── data_dir: parquet hidden-state caches ───────────────────────────
+        if data_dir is None:
+            latent_data_root = getattr(args, "ae_latent_data_dir", "latent_data")
+            task_name = getattr(args, "task", "unknown")
+            data_dir = os.path.join(project_root, latent_data_root, task_name)
+        self.data_dir = data_dir
+        os.makedirs(self.data_dir, exist_ok=True)
 
         # Determine hidden_dim from model config
         hf_model = getattr(method.model, "HF_model", None) or getattr(method.model, "model", None)
@@ -383,10 +454,11 @@ class AETrainer:
                               zip(self.target_layers, self.cfg.target_layers)}
 
         print(f"[AETrainer] hidden_dim={self.hidden_dim}, num_layers={self.num_total_layers}")
+        print(f"[AETrainer] data_dir:       {self.data_dir}")
         print(f"[AETrainer] checkpoint_dir: {self.checkpoint_dir}")
 
-        # Logger
-        self.logger = AELogger(log_dir=self.checkpoint_dir)
+        # Logger (logs go to data_dir alongside parquet files)
+        self.logger = AELogger(log_dir=self.data_dir)
 
         # Print per-layer status table at startup
         self._print_layer_status()
@@ -401,7 +473,7 @@ class AETrainer:
         """Return {'input': N, 'latent': N} for an existing cache, or {} if missing."""
         counts = {}
         for kind in ("input", "latent"):
-            path = _parquet_path(self.checkpoint_dir, signed_li, kind)
+            path = _parquet_path(self.data_dir, signed_li, kind)
             if os.path.isfile(path):
                 try:
                     counts[kind] = len(pd.read_parquet(path, columns=[0]))
@@ -437,7 +509,7 @@ class AETrainer:
     def _which_layers_need_cache(self) -> List[int]:
         return [
             li for li in self.target_layers
-            if not _has_cache(self.checkpoint_dir, self._signed(li))
+            if not _has_cache(self.data_dir, self._signed(li))
         ]
 
     def _which_layers_need_training(self) -> List[int]:
@@ -449,8 +521,8 @@ class AETrainer:
     def collect_hidden_states(self, dataset_items: List[dict]) -> None:
         """Run the MAS on dataset_items and record hidden states per layer.
 
-        Layers whose cache files (input + latent parquet) already exist are
-        automatically skipped — no MAS inference is run for them.
+        Parquet files are written to ``self.data_dir``.
+        Layers whose cache files already exist there are automatically skipped.
         """
         layers_needed = self._which_layers_need_cache()
 
@@ -521,6 +593,7 @@ class AETrainer:
                 if (item_idx + 1) % flush_every == 0:
                     self._flush_buffers(buffers, append=True)
                     buffers = {li: {"input": [], "latent": []} for li in layers_needed}
+                    self._save_metadata(dataset_items, n_collected, n_skipped)
                     self.logger.log_collect(
                         f"Flushed at sample {item_idx + 1} "
                         f"({n_collected} ok, {n_skipped} skipped)"
@@ -533,10 +606,10 @@ class AETrainer:
 
         # Final flush
         self._flush_buffers(buffers, append=True)
-        self._save_metadata(dataset_items)
+        self._save_metadata(dataset_items, n_collected, n_skipped)
         self.logger.log_collect(
             f"Collection complete. {n_collected} samples collected, "
-            f"{n_skipped} skipped."
+            f"{n_skipped} skipped. Output: {self.data_dir}"
         )
 
     def _flush_buffers(
@@ -551,36 +624,54 @@ class AETrainer:
                 if not vecs:
                     continue
                 tensor = torch.stack(vecs, dim=0)          # [N, D]
-                path = _parquet_path(self.checkpoint_dir, signed_li, kind)
+                path = _parquet_path(self.data_dir, signed_li, kind)
                 if append and os.path.exists(path):
                     _save_tensor_parquet(tensor, path)
                 else:
                     arr = tensor.float().cpu().numpy()
                     pd.DataFrame(arr).to_parquet(path, index=False)
 
-    def _save_metadata(self, dataset_items: List[dict]) -> None:
-        samples_per_layer = {}
+    def _save_metadata(
+        self,
+        dataset_items: List[dict],
+        n_collected: int = -1,
+        n_skipped: int = -1,
+    ) -> None:
+        """Write / overwrite metadata JSON in data_dir with current sample counts."""
+        per_layer_info = []
         for abs_li in self.target_layers:
             signed_li = self._signed(abs_li)
-            lat_path = _parquet_path(self.checkpoint_dir, signed_li, "latent")
-            if os.path.exists(lat_path):
-                samples_per_layer[str(signed_li)] = len(pd.read_parquet(lat_path))
+            entry: dict = {"layer": signed_li}
+            for kind in ("input", "latent"):
+                p = _parquet_path(self.data_dir, signed_li, kind)
+                if os.path.isfile(p):
+                    try:
+                        entry[f"{kind}_samples"] = len(pd.read_parquet(p, columns=[0]))
+                    except Exception:
+                        entry[f"{kind}_samples"] = -1
+                else:
+                    entry[f"{kind}_samples"] = 0
+            per_layer_info.append(entry)
 
         meta = {
-            "agent_names": self.cfg.non_judger_agents,
-            "layer_indices": [self._signed(li) for li in self.target_layers],
-            "samples_per_layer": samples_per_layer,
-            "hidden_dim": self.hidden_dim,
-            "latent_steps": self.args.latent_steps,
-            "benchmark": getattr(self.args, "task", "unknown"),
             "model_name": self.args.model_name,
-            "num_collect_samples": len(dataset_items),
-            "cache_type": "paired",
+            "task": getattr(self.args, "task", "unknown"),
+            "split": getattr(self.args, "split", "unknown"),
+            "latent_steps": self.args.latent_steps,
+            "hidden_dim": self.hidden_dim,
+            "num_total_layers": self.num_total_layers,
+            "target_layers": [self._signed(li) for li in self.target_layers],
+            "agent_names": self.cfg.non_judger_agents,
+            "num_dataset_samples": len(dataset_items),
+            "num_collected_samples": n_collected,
+            "num_skipped_samples": n_skipped,
+            "layers": per_layer_info,
+            "collected_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
         }
-        with open(_meta_path(self.checkpoint_dir), "w") as f:
+        with open(_meta_path(self.data_dir), "w") as f:
             json.dump(meta, f, indent=2)
 
-    # ── Training ──────────────────────────────────────────────────────────
+    # ── Training (reads data from data_dir, saves AE to checkpoint_dir) ───
 
     def train_all_layers(self) -> None:
         """Train a QueryAwareAutoencoder for each target layer that is missing a checkpoint."""
@@ -597,12 +688,14 @@ class AETrainer:
             self._train_one_layer(abs_li, signed_li)
 
     def _train_one_layer(self, abs_li: int, signed_li: int) -> None:
-        input_path = _parquet_path(self.checkpoint_dir, signed_li, "input")
-        latent_path = _parquet_path(self.checkpoint_dir, signed_li, "latent")
+        # Read parquet data from data_dir
+        input_path = _parquet_path(self.data_dir, signed_li, "input")
+        latent_path = _parquet_path(self.data_dir, signed_li, "latent")
 
         if not os.path.exists(input_path) or not os.path.exists(latent_path):
             raise FileNotFoundError(
-                f"Cache files missing for layer {signed_li}. Run collect_hidden_states first."
+                f"Cache files missing for layer {signed_li} in {self.data_dir}. "
+                f"Run collect_hidden_states first."
             )
 
         # Load data
@@ -733,6 +826,7 @@ class AETrainer:
             model.load_state_dict(best_state)
         model.set_norm_stats(mean_lat, std_lat, mean_inp, std_inp)
 
+        # Save AE model to checkpoint_dir
         self._save_ae_checkpoint(model, signed_li, log_history)
 
         self.logger.end_layer(
@@ -745,7 +839,7 @@ class AETrainer:
             log_history=log_history,
         )
 
-    # ── Checkpoint I/O ────────────────────────────────────────────────────
+    # ── Checkpoint I/O (AE models → checkpoint_dir) ───────────────────────
 
     def _save_ae_checkpoint(
         self,
@@ -795,14 +889,15 @@ class AETrainer:
             models[signed_li] = self.load_ae(signed_li)
         return models
 
-    # ── Main entry point ──────────────────────────────────────────────────
+    # ── Main entry points ─────────────────────────────────────────────────
+
+    def collect_only(self, dataset_items: List[dict]) -> None:
+        """Collect hidden states and save to ``data_dir``. No AE training."""
+        self.collect_hidden_states(dataset_items)
+        self.logger.finish()
 
     def collect_and_train(self, dataset_items: List[dict]) -> None:
-        """Full pipeline: collect missing caches, then train missing AEs."""
+        """Full pipeline: collect missing caches to data_dir, then train AEs to checkpoint_dir."""
         self.collect_hidden_states(dataset_items)
         self.train_all_layers()
         self.logger.finish()
-
-
-# ── math import needed in _train_one_layer ────────────────────────────────────
-import math

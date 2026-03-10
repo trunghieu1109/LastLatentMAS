@@ -45,6 +45,9 @@ class LatentMASMethod:
         self.logger = logger
         self.save_kv = bool(getattr(args, "save_kv", False)) if args else False
 
+        # AE target layers for two-phase flow (parsed list of signed ints, e.g. [-5,-4,-3,-2,-1])
+        self.ae_target_layers = getattr(args, "ae_target_layers_parsed", None)
+
         if self.latent_only:
             self.sequential_info_only = True
 
@@ -186,23 +189,42 @@ class LatentMASMethod:
                     active_ids = ids_row[mask_row.bool()].tolist()
                     wrapped_tokens_batch.append(self.model.tokenizer.convert_ids_to_tokens(active_ids))
 
-                past_kv = self.model.generate_latent_batch(
-                    wrapped_ids,
-                    attention_mask=wrapped_mask,
-                    latent_steps=self.latent_steps,
-                    past_key_values=past_kv,
-                )
-                if self.accumulate_latent:
-                    # Strip input tokens from KV cache, keep accumulated latent thoughts
-                    input_len = wrapped_ids.shape[1]
-                    past_kv = self._strip_input_from_past(
-                        past_kv, prev_past_len, prev_past_len + input_len
+                if self.model._ae_controllers:
+                    # ── Two-phase: Think → AE Reconstruct → Transfer ──────
+                    past_kv, _, _ = self.model.generate_latent_then_transfer(
+                        wrapped_ids,
+                        attention_mask=wrapped_mask,
+                        latent_steps=self.latent_steps,
+                        past_key_values=past_kv,
+                        ae_target_layers=self.ae_target_layers,
                     )
-                elif self.sequential_info_only or self.latent_only:
-                    new_past_len = _past_length(past_kv)
-                    tokens_added = new_past_len - prev_past_len
-                    tokens_to_keep = self.latent_steps if self.latent_only else tokens_added
-                    past_kv = self._truncate_past(past_kv, tokens_to_keep)
+                    # Transfer KV = prev_agents_KV + N_ae_layers transfer tokens
+                    # For sequential/latent modes: keep only this agent's transfer tokens
+                    if self.sequential_info_only or self.latent_only:
+                        n_transfer = len(
+                            self.ae_target_layers or list(self.model._ae_controllers.keys())
+                        )
+                        past_kv = self._truncate_past(past_kv, n_transfer)
+                    # accumulate_latent: no truncation — transfer tokens accumulate naturally
+
+                else:
+                    # ── Original flow: standard latent steps ──────────────
+                    past_kv = self.model.generate_latent_batch(
+                        wrapped_ids,
+                        attention_mask=wrapped_mask,
+                        latent_steps=self.latent_steps,
+                        past_key_values=past_kv,
+                    )
+                    if self.accumulate_latent:
+                        input_len = wrapped_ids.shape[1]
+                        past_kv = self._strip_input_from_past(
+                            past_kv, prev_past_len, prev_past_len + input_len
+                        )
+                    elif self.sequential_info_only or self.latent_only:
+                        new_past_len = _past_length(past_kv)
+                        tokens_added = new_past_len - prev_past_len
+                        tokens_to_keep = self.latent_steps if self.latent_only else tokens_added
+                        past_kv = self._truncate_past(past_kv, tokens_to_keep)
 
                 for idx in range(batch_size):
                     mask = wrapped_mask[idx].bool()
@@ -421,33 +443,50 @@ class LatentMASMethod:
                     active_ids = ids_row[mask_row.bool()].tolist()
                     wrapped_tokens_batch.append(self.model.tokenizer.convert_ids_to_tokens(active_ids))
 
-                past_kv, previous_hidden_embedding = self.model.generate_latent_batch_hidden_state(
-                    wrapped_ids,
-                    attention_mask=wrapped_mask,
-                    latent_steps=self.latent_steps,
-                    past_key_values=past_kv,
-                )
-                if self.accumulate_latent:
-                    # Strip input tokens from KV cache, keep accumulated latent thoughts
-                    input_len = wrapped_ids.shape[1]
-                    past_kv = self._strip_input_from_past(
-                        past_kv, prev_past_len, prev_past_len + input_len
+                if self.model._ae_controllers:
+                    # ── Two-phase: Think → AE Reconstruct → Transfer ──────
+                    past_kv, transfer_embeds, _ = self.model.generate_latent_then_transfer(
+                        wrapped_ids,
+                        attention_mask=wrapped_mask,
+                        latent_steps=self.latent_steps,
+                        past_key_values=past_kv,
+                        ae_target_layers=self.ae_target_layers,
                     )
-                    # Only keep latent embeddings (strip input embeddings)
-                    if self.latent_steps > 0:
-                        previous_hidden_embedding = previous_hidden_embedding[:, -self.latent_steps:, :]
-                    else:
-                        previous_hidden_embedding = previous_hidden_embedding[:, 0:0, :]
-                elif self.sequential_info_only or self.latent_only:
-                    new_past_len = _past_length(past_kv)
-                    tokens_added = new_past_len - prev_past_len
-                    tokens_to_keep = self.latent_steps if self.latent_only else tokens_added
-                    past_kv = self._truncate_past(past_kv, tokens_to_keep)
-                    if self.latent_only:
+                    # transfer_embeds: [B, N_ae_layers, D] — already aligned
+                    previous_hidden_embedding = transfer_embeds.detach()
+
+                    if self.sequential_info_only or self.latent_only:
+                        n_transfer = transfer_embeds.shape[1]
+                        past_kv = self._truncate_past(past_kv, n_transfer)
+                    # accumulate_latent: no truncation needed
+
+                else:
+                    # ── Original flow: standard latent steps ──────────────
+                    past_kv, previous_hidden_embedding = self.model.generate_latent_batch_hidden_state(
+                        wrapped_ids,
+                        attention_mask=wrapped_mask,
+                        latent_steps=self.latent_steps,
+                        past_key_values=past_kv,
+                    )
+                    if self.accumulate_latent:
+                        input_len = wrapped_ids.shape[1]
+                        past_kv = self._strip_input_from_past(
+                            past_kv, prev_past_len, prev_past_len + input_len
+                        )
                         if self.latent_steps > 0:
                             previous_hidden_embedding = previous_hidden_embedding[:, -self.latent_steps:, :]
                         else:
                             previous_hidden_embedding = previous_hidden_embedding[:, 0:0, :]
+                    elif self.sequential_info_only or self.latent_only:
+                        new_past_len = _past_length(past_kv)
+                        tokens_added = new_past_len - prev_past_len
+                        tokens_to_keep = self.latent_steps if self.latent_only else tokens_added
+                        past_kv = self._truncate_past(past_kv, tokens_to_keep)
+                        if self.latent_only:
+                            if self.latent_steps > 0:
+                                previous_hidden_embedding = previous_hidden_embedding[:, -self.latent_steps:, :]
+                            else:
+                                previous_hidden_embedding = previous_hidden_embedding[:, 0:0, :]
 
                 embedding_record.append(previous_hidden_embedding)
 

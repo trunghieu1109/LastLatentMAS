@@ -42,3 +42,6 @@ ae_analysis/
 *.bin
 *.safetensors
 .cache/
+
+# Latent data
+latent_data/
