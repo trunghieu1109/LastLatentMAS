@@ -384,6 +384,25 @@ def _jacobian_l1_loop(decoder: nn.Module, z: torch.Tensor, num_rows: int) -> tor
     return J.abs().mean()
 
 
+def gate_usage_loss(gate: torch.Tensor, target_rate: float = 0.3) -> torch.Tensor:
+    """Penalize gate activation rate being too low (gate collapse prevention).
+
+    Forces mean(gate) to stay near `target_rate`, preventing the trivial
+    solution where all gates → 0 (which makes recon loss = 0 for free).
+
+    Formula:
+        L_usage = (mean(gate) - target_rate)²
+
+    Args:
+        gate        : [B, D]  — per-feature gate values ∈ (0, 1).
+        target_rate : desired average gate activation level.
+
+    Returns:
+        Scalar usage loss (non-negative).
+    """
+    return (gate.mean() - target_rate).pow(2)
+
+
 def total_loss(
     h_orig: torch.Tensor,
     h_rec: torch.Tensor,
@@ -393,6 +412,8 @@ def total_loss(
     *,
     lambda_sparse: float = 0.01,
     lambda_attn: float = 0.1,
+    lambda_usage: float = 1.0,
+    gate_target_rate: float = 0.3,
     jacobian_sample_rows: int = 64,
 ) -> Tuple[torch.Tensor, dict]:
     """Compute the combined training loss.
@@ -404,18 +425,26 @@ def total_loss(
         L_sparse  = mean(|z|)   [L1 on bottleneck — fast sparsity]
         L_attn    = binary_entropy( gate )
                     Pushes gate toward {0,1} — crisp feature selection.
-        L_total   = L_recon + λ_sparse * L_sparse + λ_attn * L_attn
+        L_usage   = (mean(gate) - target_rate)²
+                    Prevents gate collapse to all-zeros.
+        L_total   = L_recon + λ_sparse * L_sparse + λ_attn * L_attn + λ_usage * L_usage
     """
     l_recon  = weighted_reconstruction_loss(h_orig, h_rec, gate)
     l_sparse = sparsity_loss(z)                # fast O(B×Z) L1, not Jacobian
     l_attn   = gate_binary_entropy_loss(gate)
+    l_usage  = gate_usage_loss(gate, target_rate=gate_target_rate)
 
-    l_total = l_recon + lambda_sparse * l_sparse + lambda_attn * l_attn
+    l_total = (l_recon
+               + lambda_sparse * l_sparse
+               + lambda_attn * l_attn
+               + lambda_usage * l_usage)
 
     breakdown = {
         "recon":  l_recon.item(),
         "sparse": l_sparse.item(),
         "attn":   l_attn.item(),
+        "usage":  l_usage.item(),
         "total":  l_total.item(),
     }
     return l_total, breakdown
+

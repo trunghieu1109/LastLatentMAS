@@ -306,6 +306,13 @@ def main():
                         default=_env("AE_NON_JUDGER_AGENTS", "Planner,Critic,Refiner"),
                         help="Comma-separated agent names whose hidden states are collected.")
 
+    # ── WCT space alignment args ──────────────────────────────────────────
+    parser.add_argument("--wct_params_dir", type=str,
+                        default=_env("WCT_PARAMS_DIR", ""),
+                        help="Directory with precomputed WCT params (from build_wct_params.py). "
+                             "If set, WCT is applied after AE to map hidden states from "
+                             "layer_i space to last layer space before realignment.")
+
     args = parser.parse_args()
     
     if args.method == "latent_mas" and args.use_vllm:
@@ -375,6 +382,16 @@ def main():
                 target_layers=_ae_layers,
                 device=_ae_device,
             )
+
+            # Auto-load WCT params if specified
+            _wct_dir = args.wct_params_dir
+            if not _wct_dir:
+                # Default: check wct_params/ in project root
+                _wct_dir_default = os.path.join(os.path.dirname(__file__), "wct_params")
+                if os.path.isdir(_wct_dir_default):
+                    _wct_dir = _wct_dir_default
+            if _wct_dir and os.path.isdir(_wct_dir):
+                model.load_wct_params(_wct_dir)
     elif args.method in ('collect_and_train_ae', 'collect_only'):
         method = LatentMASMethod(
             model,

@@ -44,8 +44,13 @@ sys.path.insert(0, ROOT)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Dark theme
+# Light theme
 # ──────────────────────────────────────────────────────────────────────────────
+
+# Single-color palette for each data category
+COLOR_INPUT   = "#2B8C8C"   # teal
+COLOR_LATENT  = "#E06050"   # coral
+COLOR_AE      = "#D4A030"   # amber
 
 def _setup_mpl(interactive: bool = False):
     import matplotlib
@@ -53,14 +58,14 @@ def _setup_mpl(interactive: bool = False):
         matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     plt.rcParams.update({
-        "figure.facecolor": "#0F1117",
-        "axes.facecolor":   "#181C24",
-        "axes.edgecolor":   "#333",
-        "axes.labelcolor":  "#DDD",
-        "xtick.color":      "#AAA",
-        "ytick.color":      "#AAA",
-        "text.color":       "#EEE",
-        "grid.color":       "#2A2E38",
+        "figure.facecolor": "#FFFFFF",
+        "axes.facecolor":   "#F7F7F7",
+        "axes.edgecolor":   "#CCCCCC",
+        "axes.labelcolor":  "#333333",
+        "xtick.color":      "#555555",
+        "ytick.color":      "#555555",
+        "text.color":       "#222222",
+        "grid.color":       "#E0E0E0",
         "grid.linewidth":   0.6,
         "font.family":      "sans-serif",
         "font.size":        10,
@@ -312,19 +317,11 @@ def pca_project(*arrays):
 # Plotting
 # ──────────────────────────────────────────────────────────────────────────────
 
-_QUERY_COLORS = [
-    "#FF6B6B", "#4ECDC4", "#FFD93D", "#6BCB77", "#4D96FF",
-    "#FF8C32", "#AD68FF", "#FF4C8B", "#00D2D3", "#FFC75F",
-    "#A5E887", "#FF6F91", "#6FDFDF", "#FFB3BA", "#C9B1FF",
-    "#FFF176", "#80CBC4", "#F48FB1", "#81D4FA", "#A5D6A7",
-]
-
-
 def get_query_color(q_idx: int, n_queries: int):
-    if n_queries <= len(_QUERY_COLORS):
-        return _QUERY_COLORS[q_idx % len(_QUERY_COLORS)]
+    """Return query color — but now we use single category colors, so this
+    is only used for centroid labels."""
     import matplotlib.cm as cm
-    return cm.tab20(q_idx / max(1, n_queries - 1))
+    return cm.Set2(q_idx / max(1, n_queries - 1))
 
 
 def plot_layer(
@@ -356,9 +353,9 @@ def plot_layer(
     D       = data["hidden_dim"]
     has_ae  = H_ae is not None
 
-    n_panels = 4 if has_ae else 3
-    ratios   = [2, 1.2, 1, 2] if has_ae else [2, 1.2, 1]
-    figw     = 30 if has_ae else 22
+    n_panels = 3 if has_ae else 2
+    ratios   = [2, 1, 2] if has_ae else [2, 1]
+    figw     = 24 if has_ae else 16
 
     # PCA
     if has_ae:
@@ -380,82 +377,30 @@ def plot_layer(
 
     # ── Panel 1: PCA scatter ───────────────────────────────────────────────
     ax1 = fig.add_subplot(gs[0, 0])
-    for q in range(n_q):
-        c = get_query_color(q, n_q)
-        mask_inp = qi_inp == q
-        ax1.scatter(proj_inp[mask_inp, 0], proj_inp[mask_inp, 1],
-                    c=c, marker="o", s=50, alpha=0.85,
-                    edgecolors="white", linewidths=0.3, zorder=3)
-        mask_lat = qi_lat == q
-        ax1.scatter(proj_lat[mask_lat, 0], proj_lat[mask_lat, 1],
-                    c=c, marker="^", s=18, alpha=0.35,
-                    edgecolors="none", zorder=2)
-        if has_ae and qi_ae is not None:
-            mask_ae = qi_ae == q
-            ax1.scatter(proj_ae[mask_ae, 0], proj_ae[mask_ae, 1],
-                        c=c, marker="*", s=30, alpha=0.6,
-                        edgecolors="none", zorder=4)
+    # Single color per category (not per query)
+    ax1.scatter(proj_inp[:, 0], proj_inp[:, 1],
+                c=COLOR_INPUT, marker="s", s=40, alpha=0.75,
+                edgecolors="white", linewidths=0.3, zorder=3,
+                label="Input (■)")
+    ax1.scatter(proj_lat[:, 0], proj_lat[:, 1],
+                c=COLOR_LATENT, marker="D", s=16, alpha=0.30,
+                edgecolors="none", zorder=2,
+                label="Latent (◆)")
+    if has_ae and proj_ae is not None:
+        ax1.scatter(proj_ae[:, 0], proj_ae[:, 1],
+                    c=COLOR_AE, marker="o", s=22, alpha=0.55,
+                    edgecolors="none", zorder=4,
+                    label="AE-filtered (●)")
 
     ax1.set_xlabel(f"PC1 ({var_ratio[0]*100:.1f}%)")
     ax1.set_ylabel(f"PC2 ({var_ratio[1]*100:.1f}%)")
     ax1.set_title("PCA Projection", fontweight="bold")
     ax1.grid(True, alpha=0.3)
+    ax1.legend(loc="lower right", fontsize=8,
+               facecolor="white", edgecolor="#CCC", framealpha=0.9)
 
-    legend_elements = [
-        Line2D([0], [0], marker="o", color="w", markerfacecolor="#CCC",
-               markersize=8, label="Input (last input token)", linestyle="None"),
-        Line2D([0], [0], marker="^", color="w", markerfacecolor="#CCC",
-               markersize=8, label="Latent (thinking steps)", linestyle="None"),
-    ]
-    if has_ae:
-        legend_elements.append(
-            Line2D([0], [0], marker="*", color="w", markerfacecolor="#FFD93D",
-                   markersize=10, label="AE-filtered (★)", linestyle="None"))
-    ax1.legend(handles=legend_elements, loc="lower right", fontsize=8,
-               facecolor="#1A1E28", edgecolor="#333")
-
-    # ── Panel 2: Centroid arrows ───────────────────────────────────────────
+    # ── Panel 2: Norm distribution ────────────────────────────────────────
     ax2 = fig.add_subplot(gs[0, 1])
-    for q in range(n_q):
-        c = get_query_color(q, n_q)
-        mask_inp = qi_inp == q
-        mask_lat = qi_lat == q
-        centroid_inp = proj_inp[mask_inp].mean(axis=0)
-        centroid_lat = proj_lat[mask_lat].mean(axis=0)
-
-        ax2.scatter(centroid_inp[0], centroid_inp[1],
-                    c=c, marker="o", s=100, edgecolors="white",
-                    linewidths=0.8, zorder=3)
-        ax2.annotate("", xy=(centroid_lat[0], centroid_lat[1]),
-                     xytext=(centroid_inp[0], centroid_inp[1]),
-                     arrowprops=dict(arrowstyle="->", color=c, lw=1.5, alpha=0.7),
-                     zorder=2)
-
-        if has_ae and qi_ae is not None:
-            mask_ae = qi_ae == q
-            centroid_ae = proj_ae[mask_ae].mean(axis=0)
-            ax2.scatter(centroid_ae[0], centroid_ae[1],
-                        c=c, marker="*", s=120, edgecolors="white",
-                        linewidths=0.5, zorder=4)
-            ax2.annotate("", xy=(centroid_ae[0], centroid_ae[1]),
-                         xytext=(centroid_lat[0], centroid_lat[1]),
-                         arrowprops=dict(arrowstyle="->", color=c, lw=1.2,
-                                         alpha=0.5, linestyle="dashed"),
-                         zorder=2)
-
-        ax2.text(centroid_inp[0], centroid_inp[1], f" Q{q}",
-                 fontsize=7, color=c, alpha=0.9, va="center")
-
-    ax2.set_xlabel(f"PC1 ({var_ratio[0]*100:.1f}%)")
-    ax2.set_ylabel(f"PC2 ({var_ratio[1]*100:.1f}%)")
-    title2 = "Trajectories: input → latent"
-    if has_ae:
-        title2 += " → AE"
-    ax2.set_title(title2, fontweight="bold")
-    ax2.grid(True, alpha=0.3)
-
-    # ── Panel 3: Norm distribution ────────────────────────────────────────
-    ax3 = fig.add_subplot(gs[0, 2])
     norms_inp = np.linalg.norm(H_inp, axis=1)
     norms_lat = np.linalg.norm(H_lat, axis=1)
     inp_means = [norms_inp[qi_inp == q].mean() for q in range(n_q)]
@@ -465,58 +410,52 @@ def plot_layer(
     n_bars = 3 if has_ae else 2
     w = 0.8 / n_bars
 
-    ax3.bar(x - w, inp_means, w, color="#4ECDC4", alpha=0.8, label="Input ‖h‖")
-    ax3.bar(x,     lat_means, w, color="#FF6B6B", alpha=0.8, label="Latent ‖h‖")
+    ax2.bar(x - w, inp_means, w, color=COLOR_INPUT, alpha=0.8, label="Input ‖h‖")
+    ax2.bar(x,     lat_means, w, color=COLOR_LATENT, alpha=0.8, label="Latent ‖h‖")
 
     if has_ae:
         norms_ae = np.linalg.norm(H_ae, axis=1)
         ae_means = [norms_ae[qi_ae == q].mean() for q in range(n_q)]
-        ax3.bar(x + w, ae_means, w, color="#FFD93D", alpha=0.8, label="AE ‖h‖")
+        ax2.bar(x + w, ae_means, w, color=COLOR_AE, alpha=0.8, label="AE ‖h‖")
 
-    ax3.set_xlabel("Query")
-    ax3.set_ylabel("Mean L2 norm")
-    ax3.set_title("Hidden State Norms", fontweight="bold")
-    ax3.set_xticks(x)
-    ax3.set_xticklabels([f"Q{q}" for q in range(n_q)], fontsize=7,
+    ax2.set_xlabel("Query")
+    ax2.set_ylabel("Mean L2 norm")
+    ax2.set_title("Hidden State Norms", fontweight="bold")
+    ax2.set_xticks(x)
+    ax2.set_xticklabels([f"Q{q}" for q in range(n_q)], fontsize=7,
                         rotation=45 if n_q > 10 else 0)
-    ax3.legend(fontsize=8, facecolor="#1A1E28", edgecolor="#333")
-    ax3.grid(True, axis="y", alpha=0.3)
+    ax2.legend(fontsize=8, facecolor="white", edgecolor="#CCC", framealpha=0.9)
+    ax2.grid(True, axis="y", alpha=0.3)
 
-    # ── Panel 4: AE vs Latent only ────────────────────────────────────────
+    # ── Panel 3: AE vs Latent only ────────────────────────────────────────
     if has_ae:
-        ax4 = fig.add_subplot(gs[0, 3])
+        ax3 = fig.add_subplot(gs[0, 2])
         [proj_lat2, proj_ae2], var2 = pca_project(H_lat, H_ae)
 
+        ax3.scatter(proj_lat2[:, 0], proj_lat2[:, 1],
+                    c=COLOR_LATENT, marker="D", s=16, alpha=0.35,
+                    edgecolors="none", zorder=2, label="Latent (◆)")
+        ax3.scatter(proj_ae2[:, 0], proj_ae2[:, 1],
+                    c=COLOR_AE, marker="o", s=22, alpha=0.6,
+                    edgecolors="none", zorder=3, label="AE-filtered (●)")
+
+        # Centroid arrows per query
         for q in range(n_q):
-            c = get_query_color(q, n_q)
             mask_lat = qi_lat == q
             mask_ae = qi_ae == q
-            ax4.scatter(proj_lat2[mask_lat, 0], proj_lat2[mask_lat, 1],
-                        c=c, marker="^", s=18, alpha=0.4,
-                        edgecolors="none", zorder=2)
-            ax4.scatter(proj_ae2[mask_ae, 0], proj_ae2[mask_ae, 1],
-                        c=c, marker="*", s=30, alpha=0.7,
-                        edgecolors="none", zorder=3)
-
             if mask_lat.sum() > 0 and mask_ae.sum() > 0:
                 c_lat = proj_lat2[mask_lat].mean(axis=0)
                 c_ae  = proj_ae2[mask_ae].mean(axis=0)
-                ax4.annotate("", xy=c_ae, xytext=c_lat,
-                             arrowprops=dict(arrowstyle="->", color=c,
-                                             lw=1.2, alpha=0.6), zorder=1)
+                ax3.annotate("", xy=c_ae, xytext=c_lat,
+                             arrowprops=dict(arrowstyle="->", color="#888",
+                                             lw=1.0, alpha=0.5), zorder=1)
 
-        ax4.set_xlabel(f"PC1 ({var2[0]*100:.1f}%)")
-        ax4.set_ylabel(f"PC2 ({var2[1]*100:.1f}%)")
-        ax4.set_title("Latent (▲) vs AE-filtered (★)", fontweight="bold")
-        ax4.grid(True, alpha=0.3)
-        legend4 = [
-            Line2D([0], [0], marker="^", color="w", markerfacecolor="#CCC",
-                   markersize=8, label="Latent (raw)", linestyle="None"),
-            Line2D([0], [0], marker="*", color="w", markerfacecolor="#FFD93D",
-                   markersize=10, label="AE-filtered", linestyle="None"),
-        ]
-        ax4.legend(handles=legend4, loc="lower right", fontsize=8,
-                   facecolor="#1A1E28", edgecolor="#333")
+        ax3.set_xlabel(f"PC1 ({var2[0]*100:.1f}%)")
+        ax3.set_ylabel(f"PC2 ({var2[1]*100:.1f}%)")
+        ax3.set_title("Latent (◆) vs AE-filtered (●)", fontweight="bold")
+        ax3.grid(True, alpha=0.3)
+        ax3.legend(loc="lower right", fontsize=8,
+                   facecolor="white", edgecolor="#CCC", framealpha=0.9)
 
     # Info box
     info_text = (
@@ -530,8 +469,8 @@ def plot_layer(
         info_text += f"\nAE vectors: {len(H_ae)}"
     ax1.text(0.02, 0.98, info_text, transform=ax1.transAxes, va="top",
              ha="left", fontsize=8,
-             bbox=dict(boxstyle="round,pad=0.4", facecolor="#0F1117",
-                       alpha=0.85, edgecolor="#333"))
+             bbox=dict(boxstyle="round,pad=0.4", facecolor="white",
+                       alpha=0.85, edgecolor="#CCC"))
 
     plt.tight_layout()
 
@@ -572,10 +511,10 @@ def interactive_viewer(data_dir, n_queries, n_agents, layers, latent_steps=0):
 
     fig, ax = plt.subplots(figsize=(14, 10))
     plt.subplots_adjust(bottom=0.15)
-    ax_slider = plt.axes([0.15, 0.04, 0.7, 0.03], facecolor="#1A1E28")
+    ax_slider = plt.axes([0.15, 0.04, 0.7, 0.03], facecolor="#EEEEEE")
     slider = Slider(ax_slider, "Layer", 0, len(layers) - 1,
-                    valinit=0, valstep=1, color="#4ECDC4")
-    slider.valtext.set_color("#EEE")
+                    valinit=0, valstep=1, color=COLOR_INPUT)
+    slider.valtext.set_color("#333")
 
     def update(val):
         idx = int(slider.val)
@@ -583,42 +522,38 @@ def interactive_viewer(data_dir, n_queries, n_agents, layers, latent_steps=0):
         slider.valtext.set_text(f"Layer {layer_idx}")
         proj_inp, proj_lat, qi_inp, qi_lat, n_q, var_ratio, D = _get_data(layer_idx)
         ax.cla()
-        ax.set_facecolor("#181C24")
+        ax.set_facecolor("#F7F7F7")
+        ax.scatter(proj_inp[:, 0], proj_inp[:, 1],
+                   c=COLOR_INPUT, marker="s", s=50, alpha=0.75,
+                   edgecolors="white", linewidths=0.4, zorder=3,
+                   label="Input (■)")
+        ax.scatter(proj_lat[:, 0], proj_lat[:, 1],
+                   c=COLOR_LATENT, marker="D", s=18, alpha=0.30,
+                   edgecolors="none", zorder=2,
+                   label="Latent (◆)")
+        # Centroid arrows
         for q in range(n_q):
-            c = get_query_color(q, n_q)
             mask_inp = qi_inp == q
             mask_lat = qi_lat == q
-            ax.scatter(proj_inp[mask_inp, 0], proj_inp[mask_inp, 1],
-                       c=c, marker="o", s=60, alpha=0.85,
-                       edgecolors="white", linewidths=0.4, zorder=3)
-            ax.scatter(proj_lat[mask_lat, 0], proj_lat[mask_lat, 1],
-                       c=c, marker="^", s=20, alpha=0.35,
-                       edgecolors="none", zorder=2)
             if mask_inp.sum() > 0 and mask_lat.sum() > 0:
                 c_inp = proj_inp[mask_inp].mean(axis=0)
                 c_lat = proj_lat[mask_lat].mean(axis=0)
                 ax.annotate("", xy=c_lat, xytext=c_inp,
-                            arrowprops=dict(arrowstyle="->", color=c,
-                                            lw=1.2, alpha=0.5), zorder=1)
+                            arrowprops=dict(arrowstyle="->", color="#666",
+                                            lw=1.0, alpha=0.4), zorder=1)
                 ax.text(c_inp[0], c_inp[1], f" Q{q}", fontsize=7,
-                        color=c, alpha=0.8, va="center")
+                        color="#444", alpha=0.8, va="center")
         ax.set_xlabel(f"PC1 ({var_ratio[0]*100:.1f}%)")
         ax.set_ylabel(f"PC2 ({var_ratio[1]*100:.1f}%)")
         ax.set_title(f"Hidden States PCA — Layer {layer_idx}  |  {n_q} queries  |  D={D}",
                      fontweight="bold", fontsize=13)
         ax.grid(True, alpha=0.3)
-        legend_elems = [
-            Line2D([0], [0], marker="o", color="w", markerfacecolor="#CCC",
-                   markersize=8, label="Input (●)", linestyle="None"),
-            Line2D([0], [0], marker="^", color="w", markerfacecolor="#CCC",
-                   markersize=8, label="Latent (▲)", linestyle="None"),
-        ]
-        ax.legend(handles=legend_elems, loc="lower right", fontsize=9,
-                  facecolor="#1A1E28", edgecolor="#333")
+        ax.legend(loc="lower right", fontsize=9,
+                  facecolor="white", edgecolor="#CCC", framealpha=0.9)
         info = f"Queries: {n_q}\nPCA var: {(var_ratio[0]+var_ratio[1])*100:.1f}%"
         ax.text(0.02, 0.98, info, transform=ax.transAxes, va="top", fontsize=9,
-                bbox=dict(boxstyle="round,pad=0.4", facecolor="#0F1117",
-                          alpha=0.85, edgecolor="#333"))
+                bbox=dict(boxstyle="round,pad=0.4", facecolor="white",
+                          alpha=0.85, edgecolor="#CCC"))
         fig.canvas.draw_idle()
 
     slider.on_changed(update)
@@ -648,6 +583,142 @@ def parse_layers(spec: str, available: list) -> list:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Cross-layer distribution comparison for AE-calibrated hidden states
+# ──────────────────────────────────────────────────────────────────────────────
+
+def plot_cross_layer_distribution(
+    plt,
+    layer_data: dict,
+    out_dir: str = None,
+    max_samples: int = 5000,
+):
+    """Generate a figure comparing value range / distribution of
+    AE-calibrated hidden states across layers.
+
+    layer_data: {layer_idx: H_ae_array}  (each is N×D float32)
+    Produces 4 sub-panels:
+      1. Violin plot of per-element values per layer
+      2. Box plot of L2 norms across layers
+      3. Per-dimension std comparison (mean±std across dims)
+      4. KDE overlay of per-element value distributions
+    """
+    if not layer_data:
+        print("  [SKIP] No AE data for cross-layer distribution plot.")
+        return
+
+    import matplotlib.gridspec as gridspec
+
+    layers_sorted = sorted(layer_data.keys())
+    labels = [f"L{l}" for l in layers_sorted]
+
+    # Subsample for performance
+    sampled_flat = {}
+    norms_per_layer = {}
+    dim_stds = {}
+    for l in layers_sorted:
+        H = layer_data[l]
+        n_rows = len(H)
+        if n_rows == 0:
+            continue
+        # Flat element samples
+        flat = H.ravel()
+        if len(flat) > max_samples:
+            idx = np.random.choice(len(flat), max_samples, replace=False)
+            flat = flat[idx]
+        sampled_flat[l] = flat
+        # L2 norms
+        nrm = np.linalg.norm(H, axis=1)
+        norms_per_layer[l] = nrm
+        # Per-dim std
+        dim_stds[l] = H.std(axis=0)
+
+    fig = plt.figure(figsize=(22, 7))
+    fig.suptitle(
+        f"AE-Calibrated Hidden States — Distribution Across {len(layers_sorted)} Layers",
+        fontsize=14, fontweight="bold", y=0.99,
+    )
+    gs = gridspec.GridSpec(1, 4, figure=fig, width_ratios=[1.2, 1, 1, 1.2], wspace=0.35)
+
+    # ── Panel 1: Violin plot of element values ────────────────────────────
+    ax1 = fig.add_subplot(gs[0, 0])
+    vdata = [sampled_flat[l] for l in layers_sorted]
+    parts = ax1.violinplot(vdata, positions=range(len(layers_sorted)),
+                           showmedians=True, showextrema=False)
+    for pc in parts["bodies"]:
+        pc.set_facecolor(COLOR_AE)
+        pc.set_alpha(0.5)
+    parts["cmedians"].set_color("#333")
+    ax1.set_xticks(range(len(layers_sorted)))
+    ax1.set_xticklabels(labels, fontsize=8)
+    ax1.set_xlabel("Layer")
+    ax1.set_ylabel("Element value")
+    ax1.set_title("Value Distribution (violin)", fontweight="bold")
+    ax1.grid(True, axis="y", alpha=0.3)
+
+    # ── Panel 2: Box plot of L2 norms ─────────────────────────────────────
+    ax2 = fig.add_subplot(gs[0, 1])
+    bdata = [norms_per_layer[l] for l in layers_sorted]
+    bp = ax2.boxplot(bdata, labels=labels, patch_artist=True,
+                     widths=0.5, showfliers=False)
+    for patch in bp["boxes"]:
+        patch.set_facecolor(COLOR_AE)
+        patch.set_alpha(0.55)
+    for median in bp["medians"]:
+        median.set_color("#333")
+    ax2.set_xlabel("Layer")
+    ax2.set_ylabel("L2 norm")
+    ax2.set_title("L2 Norm Distribution", fontweight="bold")
+    ax2.tick_params(axis="x", labelsize=8)
+    ax2.grid(True, axis="y", alpha=0.3)
+
+    # ── Panel 3: Per-dimension std summary ────────────────────────────────
+    ax3 = fig.add_subplot(gs[0, 2])
+    mean_stds = [dim_stds[l].mean() for l in layers_sorted]
+    std_of_stds = [dim_stds[l].std() for l in layers_sorted]
+    x = np.arange(len(layers_sorted))
+    ax3.bar(x, mean_stds, yerr=std_of_stds, color=COLOR_AE, alpha=0.7,
+            capsize=3, ecolor="#888")
+    ax3.set_xticks(x)
+    ax3.set_xticklabels(labels, fontsize=8)
+    ax3.set_xlabel("Layer")
+    ax3.set_ylabel("Std across samples")
+    ax3.set_title("Per-Dim Std (mean ± std)", fontweight="bold")
+    ax3.grid(True, axis="y", alpha=0.3)
+
+    # ── Panel 4: KDE overlay ──────────────────────────────────────────────
+    ax4 = fig.add_subplot(gs[0, 3])
+    from scipy.stats import gaussian_kde
+    # Use a sequential colormap for layer ordering
+    import matplotlib.cm as cm
+    n_l = len(layers_sorted)
+    for i, l in enumerate(layers_sorted):
+        vals = sampled_flat[l]
+        try:
+            kde = gaussian_kde(vals, bw_method=0.15)
+            xr = np.linspace(vals.min(), vals.max(), 300)
+            shade = 0.3 + 0.6 * (i / max(1, n_l - 1))
+            ax4.plot(xr, kde(xr), color=cm.YlOrBr(shade), lw=1.5,
+                     label=labels[i], alpha=0.85)
+        except Exception:
+            pass
+    ax4.set_xlabel("Element value")
+    ax4.set_ylabel("Density")
+    ax4.set_title("KDE Overlay", fontweight="bold")
+    ax4.legend(fontsize=7, ncol=2 if n_l > 6 else 1,
+               facecolor="white", edgecolor="#CCC", framealpha=0.9)
+    ax4.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+        out_path = os.path.join(out_dir, "ae_cross_layer_distribution.png")
+        fig.savefig(out_path, dpi=150, bbox_inches="tight")
+        print(f"  → Saved: {out_path}")
+    plt.close(fig)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Main
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -673,7 +744,7 @@ Examples:
                         help="Single layer to visualize")
     parser.add_argument("--layers", default=None,
                         help="Layer spec: 'all', '0-10', '32,33,34,35,36'")
-    parser.add_argument("--n_queries", type=int, default=20,
+    parser.add_argument("--n_queries", type=int, default=200,
                         help="Number of queries to display (default: 20)")
     parser.add_argument("--n_agents", type=int, default=3,
                         help="Number of non-judger agents")
@@ -755,8 +826,17 @@ Examples:
         ae_ckpt_dir = os.path.join(ROOT, "ae_checkpoints", "paired_hidden_state_cache")
 
     if args.ae_layers and os.path.isdir(ae_ckpt_dir):
-        ae_signed_layers = [int(x.strip()) for x in args.ae_layers.split(",")]
+        # Support "all" → auto-discover from checkpoint files
+        if args.ae_layers.strip().lower() == "all":
+            ae_signed_layers = []
+            for fn in sorted(glob.glob(os.path.join(ae_ckpt_dir, "ae_layer_*.pt"))):
+                m = re.search(r"ae_layer_(-?\d+)\.pt$", os.path.basename(fn))
+                if m:
+                    ae_signed_layers.append(int(m.group(1)))
+        else:
+            ae_signed_layers = [int(x.strip()) for x in args.ae_layers.split(",")]
         print(f"\nLoading AE models from: {ae_ckpt_dir}")
+        print(f"  AE layers to load: {ae_signed_layers}")
         for sl in ae_signed_layers:
             abs_l = num_total_layers + sl if sl < 0 else sl
             ae = load_ae_for_layer(ae_ckpt_dir, sl, args.ae_device)
@@ -777,6 +857,8 @@ Examples:
     plt = _setup_mpl(interactive=False)
     out_dir = os.path.join(ROOT, args.out_dir)
     print(f"Output dir: {out_dir}\n")
+
+    ae_layer_data = {}  # collect AE arrays for cross-layer comparison
 
     for layer_idx in target_layers:
         try:
@@ -806,11 +888,17 @@ Examples:
                 )
                 qi_ae = data["query_ids_latent"]
                 print(f"  AE vectors: {len(H_ae)}")
+                ae_layer_data[layer_idx] = H_ae
 
             plot_layer(plt, data, layer_idx, out_dir=out_dir, show=False,
                        H_ae=H_ae, qi_ae=qi_ae)
         except (FileNotFoundError, ValueError) as e:
             print(f"  [SKIP] {e}")
+
+    # ── Cross-layer AE distribution comparison ──────────────────────────────
+    if len(ae_layer_data) >= 2:
+        print("\nGenerating cross-layer distribution comparison...")
+        plot_cross_layer_distribution(plt, ae_layer_data, out_dir=out_dir)
 
     print(f"\n✅ Done. PNGs saved to {out_dir}/")
 

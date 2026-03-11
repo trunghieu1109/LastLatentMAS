@@ -45,3 +45,6 @@ ae_analysis/
 
 # Latent data
 latent_data/
+
+# wct 
+wct_*/

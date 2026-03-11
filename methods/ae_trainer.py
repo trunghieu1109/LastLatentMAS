@@ -107,16 +107,16 @@ class AELogger:
               _fmt(f"  |  {n_latent:,} latent samples  {n_input:,} input samples"
                    f"  D={hidden_dim}  Z={bottleneck_dim}  epochs={epochs}", "grey"))
         print(_fmt(f"  {'epoch':>6}  {'recon':>10}  {'sparse':>10}  "
-                   f"{'attn':>10}  {'total':>10}  {'best':>10}  "
+                   f"{'attn':>10}  {'usage':>10}  {'total':>10}  {'best':>10}  "
                    f"{'lr':>8}  pat", "grey"))
-        print(_fmt("  " + "-" * 80, "grey"))
+        print(_fmt("  " + "-" * 92, "grey"))
 
         # Open CSV
         csv_path = os.path.join(self.log_dir, f"layer_{signed_li}_training.csv")
         fh = open(csv_path, "w", newline="")
         writer = csv.DictWriter(
             fh,
-            fieldnames=["epoch", "recon", "sparse", "attn", "total", "best", "lr", "patience"],
+            fieldnames=["epoch", "recon", "sparse", "attn", "usage", "total", "best", "lr", "patience"],
         )
         writer.writeheader()
         self._csv_writers[signed_li] = writer
@@ -142,6 +142,7 @@ class AELogger:
             "recon":   round(avg["recon"],   6),
             "sparse":  round(avg["sparse"],  6),
             "attn":    round(avg["attn"],     6),
+            "usage":   round(avg.get("usage", 0.0), 6),
             "total":   round(avg["total"],    6),
             "best":    round(best_loss,       6),
             "lr":      f"{lr:.2e}",
@@ -164,6 +165,7 @@ class AELogger:
                 f"  {avg['recon']:>10.5f}"
                 f"  {avg['sparse']:>10.4f}"
                 f"  {avg['attn']:>10.4f}"
+                f"  {avg.get('usage', 0.0):>10.5f}"
                 + _fmt(f"  {avg['total']:>10.5f}", total_col) +
                 _fmt(f"  {best_loss:>10.5f}", "green") +
                 _fmt(f"  {lr:>8.2e}", "grey") +
@@ -469,11 +471,31 @@ class AETrainer:
         """Return the signed layer index used in file names."""
         return self._layer_signed.get(abs_layer, abs_layer)
 
-    def _cache_sample_counts(self, signed_li: int) -> Dict[str, int]:
+    def _resolve_cache_layer(self, abs_li: int) -> int | None:
+        """Find the layer index whose parquet files actually exist on disk.
+
+        Data collected with --ae_target_layers=all uses absolute indices (0,1,...,36),
+        while --ae_target_layers="-5,-4,-3,-2,-1" uses signed indices.
+        This method checks both conventions and returns whichever has files,
+        or None if neither exists.
+
+        Priority: signed index first (canonical), then absolute index.
+        """
+        signed_li = self._signed(abs_li)
+        if _has_cache(self.data_dir, signed_li):
+            return signed_li
+        if signed_li != abs_li and _has_cache(self.data_dir, abs_li):
+            return abs_li
+        return None
+
+    def _cache_sample_counts(self, abs_li: int) -> Dict[str, int]:
         """Return {'input': N, 'latent': N} for an existing cache, or {} if missing."""
+        file_li = self._resolve_cache_layer(abs_li)
+        if file_li is None:
+            return {}
         counts = {}
         for kind in ("input", "latent"):
-            path = _parquet_path(self.data_dir, signed_li, kind)
+            path = _parquet_path(self.data_dir, file_li, kind)
             if os.path.isfile(path):
                 try:
                     counts[kind] = len(pd.read_parquet(path, columns=[0]))
@@ -488,7 +510,7 @@ class AETrainer:
         print(_fmt("  " + "-" * 60, "grey"))
         for abs_li in self.target_layers:
             signed_li = self._signed(abs_li)
-            counts = self._cache_sample_counts(signed_li)
+            counts = self._cache_sample_counts(abs_li)
             has_ae = _has_ae_checkpoint(self.checkpoint_dir, signed_li)
 
             if "input" in counts and "latent" in counts:
@@ -509,7 +531,7 @@ class AETrainer:
     def _which_layers_need_cache(self) -> List[int]:
         return [
             li for li in self.target_layers
-            if not _has_cache(self.data_dir, self._signed(li))
+            if self._resolve_cache_layer(li) is None
         ]
 
     def _which_layers_need_training(self) -> List[int]:
@@ -688,15 +710,16 @@ class AETrainer:
             self._train_one_layer(abs_li, signed_li)
 
     def _train_one_layer(self, abs_li: int, signed_li: int) -> None:
-        # Read parquet data from data_dir
-        input_path = _parquet_path(self.data_dir, signed_li, "input")
-        latent_path = _parquet_path(self.data_dir, signed_li, "latent")
-
-        if not os.path.exists(input_path) or not os.path.exists(latent_path):
+        # Resolve which file index (signed or abs) has data on disk
+        file_li = self._resolve_cache_layer(abs_li)
+        if file_li is None:
             raise FileNotFoundError(
-                f"Cache files missing for layer {signed_li} in {self.data_dir}. "
-                f"Run collect_hidden_states first."
+                f"Cache files missing for layer {signed_li} (abs {abs_li}) "
+                f"in {self.data_dir}. Run collect_hidden_states first."
             )
+
+        input_path = _parquet_path(self.data_dir, file_li, "input")
+        latent_path = _parquet_path(self.data_dir, file_li, "latent")
 
         # Load data
         H_input  = _load_tensor_parquet(input_path)   # [N_input, D]
@@ -742,7 +765,7 @@ class AETrainer:
         best_loss = float("inf")
         best_state = None
         patience_counter = 0
-        log_history = {"recon": [], "sparse": [], "attn": [], "total": []}
+        log_history = {"recon": [], "sparse": [], "attn": [], "usage": [], "total": []}
 
         self.logger.begin_layer(
             signed_li=signed_li,
@@ -759,7 +782,7 @@ class AETrainer:
 
         iterator = tqdm(range(self.cfg.epochs), desc=f"AE layer {signed_li}", leave=False)
         for epoch in iterator:
-            epoch_stats = {"recon": 0.0, "sparse": 0.0, "attn": 0.0, "total": 0.0}
+            epoch_stats = {"recon": 0.0, "sparse": 0.0, "attn": 0.0, "usage": 0.0, "total": 0.0}
             n_batches = 0
 
             for h_lat_n, h_inp_n, h_lat_orig in loader:
