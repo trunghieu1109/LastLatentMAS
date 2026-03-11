@@ -48,3 +48,5 @@ latent_data/
 
 # wct 
 wct_*/
+
+run_checkpoints/
